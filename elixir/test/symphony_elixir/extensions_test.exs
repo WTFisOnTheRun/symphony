@@ -544,7 +544,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Raw JSON debug API"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
-    assert html =~ "rendered"
+    assert html =~ "review paths"
+    assert html =~ "next human actions"
     assert html =~ "Runtime Heartbeat"
     assert html =~ "API reachable"
     assert html =~ "Copy API URL"
@@ -589,9 +590,8 @@ defmodule SymphonyElixir.ExtensionsTest do
       Keyword.put(state, :snapshot, updated_snapshot)
     end)
 
-    StatusDashboard.notify_update()
-
     assert_eventually(fn ->
+      StatusDashboard.notify_update()
       render(view) =~ "agent message content streaming: structured update"
     end)
   end
