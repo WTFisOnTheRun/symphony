@@ -43,7 +43,7 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
-        comments(first: 30) {
+        comments(first: 100) {
           nodes {
             id
             body
@@ -96,7 +96,7 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
-        comments(first: 30) {
+        comments(first: 100) {
           nodes {
             id
             body
