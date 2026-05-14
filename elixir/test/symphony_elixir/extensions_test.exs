@@ -505,8 +505,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
     assert dashboard_css =~ ":root {"
     assert dashboard_css =~ ".status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ ".task-row"
+    assert dashboard_css =~ ".milestone-list"
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"
@@ -539,21 +539,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     {:ok, view, html} = live(build_conn(), "/")
-    assert html =~ "Operations Dashboard"
+    assert html =~ "DTS Symphony Operator Dashboard"
+    assert html =~ "Human operator surface"
+    assert html =~ "Raw JSON debug API"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "rendered"
-    assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "Codex update"
+    assert html =~ "Runtime Heartbeat"
+    assert html =~ "API reachable"
+    assert html =~ "Copy API URL"
+    assert html =~ "Task Progress"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -594,6 +594,78 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_eventually(fn ->
       render(view) =~ "agent message content streaming: structured update"
     end)
+  end
+
+  test "dashboard liveview renders ledger-backed operator task states" do
+    logs_root = dashboard_logs_root()
+    write_dashboard_ledger_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :DashboardLedgerOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "MT-HTTP"
+    assert html =~ "streaming turn"
+    assert html =~ "artifact/evidence path discovered"
+    assert html =~ "MT-DONE"
+    assert html =~ "in review"
+    assert html =~ "C:/tmp/MT-DONE/REVIEW.md"
+    assert html =~ "MT-BLOCK"
+    assert html =~ "Synthetic blocked fixture"
+    assert html =~ "fixture_blocker"
+    assert html =~ "Resolve fixture blocker"
+    assert html =~ "Ledgers read"
+  end
+
+  test "dashboard liveview reads UTF-8 BOM encoded watchdog JSON files" do
+    logs_root = dashboard_logs_root()
+    write_bom_dashboard_ledger_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :DashboardBomLedgerOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "MT-BOM"
+    assert html =~ "BOM encoded blocker"
+    assert html =~ "bom_blocker"
+    assert html =~ "Resolve BOM fixture"
+    refute html =~ "Runtime heartbeat file missing"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -673,6 +745,8 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp start_test_endpoint(overrides) do
+    overrides = Keyword.put_new(overrides, :dts_logs_root, dashboard_logs_root())
+
     endpoint_config =
       :symphony_elixir
       |> Application.get_env(SymphonyElixirWeb.Endpoint, [])
@@ -681,6 +755,163 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
+  end
+
+  defp dashboard_logs_root do
+    root = Path.join(System.tmp_dir!(), "symphony-elixir-dashboard-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(Path.join(root, "ledger"))
+    root
+  end
+
+  defp write_dashboard_ledger_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [
+        %{
+          issue_identifier: "MT-HTTP",
+          issue_id: "issue-http",
+          state: "In Progress",
+          started_at: "2026-05-14T10:00:00Z",
+          last_event_at: "2026-05-14T10:05:00Z",
+          last_message: "fixture running heartbeat",
+          workspace_path: "C:/tmp/MT-HTTP"
+        }
+      ],
+      retrying: [],
+      stale_ready: [],
+      terminal: ["MT-DONE"],
+      ledgers: [
+        Path.join(ledger_root, "MT-HTTP.json"),
+        Path.join(ledger_root, "MT-DONE.json"),
+        Path.join(ledger_root, "MT-BLOCK.json")
+      ],
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    write_ledger(
+      ledger_root,
+      "MT-HTTP",
+      %{
+        "state" => "RUNNING",
+        "phase" => "streaming turn",
+        "workspace" => "C:/tmp/MT-HTTP",
+        "last_event_at" => "2026-05-14T10:05:00Z",
+        "last_message" => "fixture running heartbeat",
+        "milestones" => fixture_milestones("running")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-DONE",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "evidence posted",
+        "workspace" => "C:/tmp/MT-DONE",
+        "latest_output_path" => "C:/tmp/MT-DONE/REVIEW.md",
+        "evidence_paths" => ["C:/tmp/MT-DONE/REVIEW.md"],
+        "last_event_at" => "2026-05-14T10:10:00Z",
+        "last_message" => "fixture review package ready",
+        "next_human_action" => "Review fixture evidence",
+        "milestones" => fixture_milestones("passed")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-BLOCK",
+      %{
+        "state" => "BLOCKED",
+        "phase" => "blocked by fixture",
+        "workspace" => "C:/tmp/MT-BLOCK",
+        "blocker_reason" => "Synthetic blocked fixture",
+        "blocker_fingerprint" => "fixture_blocker",
+        "next_human_action" => "Resolve fixture blocker",
+        "last_event_at" => "2026-05-14T10:15:00Z",
+        "milestones" => fixture_milestones("blocked")
+      }
+    )
+  end
+
+  defp write_bom_dashboard_ledger_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [],
+      retrying: [],
+      stale_ready: [],
+      terminal: ["MT-BOM"],
+      ledgers: [Path.join(ledger_root, "MT-BOM.json")],
+      latest_error: nil
+    }
+
+    write_bom_json!(Path.join(logs_root, "runtime-state.json"), runtime_state)
+
+    write_bom_json!(Path.join(ledger_root, "MT-BOM.json"), %{
+      "run_id" => "MT-BOM-fixture",
+      "issue_id" => "MT-BOM-id",
+      "issue_identifier" => "MT-BOM",
+      "attempt" => 1,
+      "state" => "BLOCKED",
+      "phase" => "bom fixture",
+      "workspace" => "C:/tmp/MT-BOM",
+      "blocker_reason" => "BOM encoded blocker",
+      "blocker_fingerprint" => "bom_blocker",
+      "next_human_action" => "Resolve BOM fixture",
+      "started_at" => "2026-05-14T10:00:00Z",
+      "last_event_at" => "2026-05-14T10:15:00Z",
+      "milestones" => fixture_milestones("blocked"),
+      "history" => []
+    })
+  end
+
+  defp write_bom_json!(path, payload) do
+    File.write!(path, <<0xEF, 0xBB, 0xBF>> <> Jason.encode!(payload, pretty: true))
+  end
+
+  defp write_ledger(ledger_root, identifier, fields) do
+    body =
+      %{
+        "run_id" => "#{identifier}-fixture",
+        "issue_id" => "#{identifier}-id",
+        "issue_identifier" => identifier,
+        "attempt" => 1,
+        "started_at" => "2026-05-14T10:00:00Z",
+        "ended_at" => nil,
+        "session_id" => "#{identifier}-session",
+        "history" => []
+      }
+      |> Map.merge(fields)
+      |> Jason.encode!(pretty: true)
+
+    File.write!(Path.join(ledger_root, "#{identifier}.json"), body)
+  end
+
+  defp fixture_milestones(state) do
+    [
+      "issue eligible",
+      "issue claimed",
+      "workspace prepared",
+      "prompt built",
+      "agent launched",
+      "first event received",
+      "heartbeat updated",
+      "artifact/evidence path discovered",
+      "verification started",
+      "terminal state reached"
+    ]
+    |> Map.new(&{&1, %{"state" => state, "at" => "2026-05-14T10:00:00Z"}})
   end
 
   defp static_snapshot do

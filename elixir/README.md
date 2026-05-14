@@ -153,12 +153,19 @@ codex:
 
 ## Web dashboard
 
-The observability UI now runs on a minimal Phoenix stack:
+The operator dashboard now runs on a minimal Phoenix stack:
 
-- LiveView for the dashboard at `/`
-- JSON API for operational debugging under `/api/v1/*`
+- LiveView for the human dashboard at `/`
+- Raw JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+The root dashboard reads aggregate runner health from the in-process state API and reads
+task-level milestone, blocker, review-path, and next-action detail from the DTS watchdog
+surfaces under `C:\Users\Elvis\Dev\dts-symphony-runner-logs\runtime-state.json` and
+`C:\Users\Elvis\Dev\dts-symphony-runner-logs\ledger\*.json`. LiveView PubSub updates are
+used when the orchestrator changes state; a 30-second file-poll fallback keeps external
+watchdog heartbeat changes visible without requiring a manual browser refresh.
 
 ## Project Layout
 
