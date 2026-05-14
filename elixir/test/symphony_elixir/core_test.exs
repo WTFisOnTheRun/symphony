@@ -548,10 +548,147 @@ defmodule SymphonyElixir.CoreTest do
     state = :sys.get_state(pid)
 
     refute Map.has_key?(state.running, issue_id)
-    assert MapSet.member?(state.completed, issue_id)
+    assert %{completed_at: %DateTime{}, observed_updated_at: nil} = state.completed[issue_id]
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+  end
+
+  test "continuation retry records the completed issue update baseline without redispatching" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo"],
+      max_concurrent_agents: 1
+    )
+
+    issue_id = "issue-completed-baseline"
+    retry_token = make_ref()
+    observed_at = ~U[2026-05-13 22:05:00Z]
+    completed_at = DateTime.add(observed_at, -10, :second)
+    orchestrator_name = Module.concat(__MODULE__, :CompletedBaselineOrchestrator)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-559",
+      state: "Todo",
+      title: "Completed but unchanged",
+      updated_at: observed_at
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{},
+          claimed: MapSet.new(),
+          completed: %{
+            issue_id => %{
+              completed_at: completed_at,
+              observed_updated_at: nil
+            }
+          },
+          retry_attempts: %{
+            issue_id => %{
+              attempt: 1,
+              retry_token: retry_token,
+              identifier: "MT-559"
+            }
+          }
+      }
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert state.completed[issue_id].observed_updated_at == observed_at
+  end
+
+  test "active retry honors needs-human observability ledger guard" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo"],
+      max_concurrent_agents: 1
+    )
+
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ledger-retry-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      restore_app_env(:log_file, previous_log_file)
+      File.rm_rf(logs_root)
+    end)
+
+    issue_id = "issue-ledger-retry"
+    retry_token = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :LedgerRetryOrchestrator)
+
+    File.write!(
+      Path.join(ledger_root, "MT-560.json"),
+      Jason.encode!(%{
+        state: "NEEDS HUMAN",
+        last_human_activity_at: nil
+      })
+    )
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-560",
+      state: "Todo",
+      title: "Needs human retry",
+      comments: [%{body: "## Symphony Blocked - repeated blocker", created_at: ~U[2026-05-13 22:10:00Z]}]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{},
+          claimed: MapSet.new(),
+          retry_attempts: %{
+            issue_id => %{
+              attempt: 1,
+              retry_token: retry_token,
+              identifier: "MT-560"
+            }
+          }
+      }
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do

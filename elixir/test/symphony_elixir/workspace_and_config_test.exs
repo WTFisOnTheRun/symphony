@@ -321,6 +321,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         "id" => "user-1"
       },
       "labels" => %{"nodes" => [%{"name" => "Backend"}]},
+      "comments" => %{
+        "nodes" => [
+          %{
+            "id" => "comment-1",
+            "body" => "Elvis review",
+            "createdAt" => "2026-01-01T01:00:00Z",
+            "updatedAt" => "2026-01-01T01:05:00Z"
+          }
+        ]
+      },
       "inverseRelations" => %{
         "nodes" => [
           %{
@@ -353,6 +363,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert issue.state == "Todo"
     assert issue.assignee_id == "user-1"
     assert issue.assigned_to_worker
+    assert [%{body: "Elvis review", created_at: ~U[2026-01-01 01:00:00Z]}] = issue.comments
   end
 
   test "linear client marks explicitly unassigned issues as not routed to worker" do
@@ -514,6 +525,103 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     }
 
     refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "completed active issue waits for a newer Linear update before redispatch" do
+    completed_at = ~U[2026-05-13 21:45:00Z]
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      completed: %{
+        "completed-1" => %{
+          completed_at: completed_at,
+          observed_updated_at: completed_at
+        }
+      },
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    unchanged_issue = %Issue{
+      id: "completed-1",
+      identifier: "MT-1008",
+      title: "Already finished turn",
+      state: "Todo",
+      updated_at: completed_at,
+      blocked_by: []
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(unchanged_issue, state)
+
+    issue_with_new_human_update = %{
+      unchanged_issue
+      | updated_at: DateTime.add(completed_at, 1, :second)
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue_with_new_human_update, state)
+  end
+
+  test "needs-human observability ledger blocks dispatch until newer human activity appears" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ledger-dispatch-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    File.write!(
+      Path.join(ledger_root, "MT-1009.json"),
+      Jason.encode!(%{
+        state: "NEEDS HUMAN",
+        last_human_activity_at: "2026-05-13T21:45:00Z"
+      })
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    unchanged_issue = %Issue{
+      id: "ledger-1",
+      identifier: "MT-1009",
+      title: "Needs human",
+      state: "Todo",
+      comments: [
+        %{body: "Elvis review", created_at: ~U[2026-05-13 21:45:00Z]},
+        %{body: "## Symphony Run Status", created_at: ~U[2026-05-13 21:50:00Z]}
+      ]
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(unchanged_issue, state)
+
+    issue_with_new_human_activity = %{
+      unchanged_issue
+      | comments: [
+          %{body: "Elvis review", created_at: ~U[2026-05-13 21:45:00Z]},
+          %{body: "Elvis approved rerun", created_at: ~U[2026-05-13 21:55:00Z]},
+          %{body: "## Symphony Run Status", created_at: ~U[2026-05-13 22:00:00Z]}
+        ]
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue_with_new_human_activity, state)
+
+    issue_without_ledger = %{unchanged_issue | identifier: "MT-1010"}
+    assert Orchestrator.should_dispatch_issue_for_test(issue_without_ledger, state)
   end
 
   test "issue assigned to another worker is not dispatch-eligible" do

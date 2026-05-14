@@ -43,6 +43,14 @@ defmodule SymphonyElixir.Linear.Client do
             }
           }
         }
+        comments(first: 30) {
+          nodes {
+            id
+            body
+            createdAt
+            updatedAt
+          }
+        }
         createdAt
         updatedAt
       }
@@ -86,6 +94,14 @@ defmodule SymphonyElixir.Linear.Client do
                 name
               }
             }
+          }
+        }
+        comments(first: 30) {
+          nodes {
+            id
+            body
+            createdAt
+            updatedAt
           }
         }
         createdAt
@@ -459,6 +475,7 @@ defmodule SymphonyElixir.Linear.Client do
       url: issue["url"],
       assignee_id: assignee_field(assignee, "id"),
       blocked_by: extract_blockers(issue),
+      comments: extract_comments(issue),
       labels: extract_labels(issue),
       assigned_to_worker: assigned_to_worker?(assignee, assignee_filter),
       created_at: parse_datetime(issue["createdAt"]),
@@ -546,6 +563,25 @@ defmodule SymphonyElixir.Linear.Client do
   end
 
   defp extract_labels(_), do: []
+
+  defp extract_comments(%{"comments" => %{"nodes" => comments}}) when is_list(comments) do
+    comments
+    |> Enum.map(&normalize_comment/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp extract_comments(_), do: []
+
+  defp normalize_comment(comment) when is_map(comment) do
+    %{
+      id: comment["id"],
+      body: comment["body"],
+      created_at: parse_datetime(comment["createdAt"]),
+      updated_at: parse_datetime(comment["updatedAt"])
+    }
+  end
+
+  defp normalize_comment(_), do: nil
 
   defp extract_blockers(%{"inverseRelations" => %{"nodes" => inverse_relations}})
        when is_list(inverse_relations) do

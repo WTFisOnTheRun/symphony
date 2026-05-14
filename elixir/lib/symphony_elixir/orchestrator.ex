@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @default_dts_logs_root "C:/Users/Elvis/Dev/dts-symphony-runner-logs"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -34,7 +35,7 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       running: %{},
-      completed: MapSet.new(),
+      completed: %{},
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
@@ -561,6 +562,8 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      !completed_issue_waiting_for_update?(issue, state) and
+      !ledger_blocks_dispatch?(issue) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -765,7 +768,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp complete_issue(%State{} = state, issue_id) do
     %{
       state
-      | completed: MapSet.put(state.completed, issue_id),
+      | completed:
+          Map.put(normalize_completed(state.completed), issue_id, %{
+            completed_at: DateTime.utc_now(),
+            observed_updated_at: nil
+          }),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
@@ -901,23 +908,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
-         dispatch_slots_available?(issue, state) and
-         worker_slots_available?(state, metadata[:worker_host]) do
-      {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
-    else
-      Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+    cond do
+      ledger_blocks_dispatch?(issue) ->
+        Logger.info("Skipping retry dispatch for #{issue_context(issue)}; observability ledger requires human intervention")
+        {:noreply, %{state | retry_attempts: Map.delete(state.retry_attempts, issue.id)}}
 
-      {:noreply,
-       schedule_issue_retry(
-         state,
-         issue.id,
-         attempt + 1,
-         Map.merge(metadata, %{
-           identifier: issue.identifier,
-           error: "no available orchestrator slots"
-         })
-       )}
+      completed_issue_waiting_for_update?(issue, state) ->
+        Logger.info("Skipping continuation retry for #{issue_context(issue)}; issue has not changed since the last normal agent completion")
+
+        state =
+          state
+          |> mark_completed_issue_observed(issue)
+          |> then(&%{&1 | retry_attempts: Map.delete(&1.retry_attempts, issue.id)})
+
+        {:noreply, state}
+
+      retry_candidate_issue?(issue, terminal_state_set()) and
+        dispatch_slots_available?(issue, state) and
+          worker_slots_available?(state, metadata[:worker_host]) ->
+        {:noreply, dispatch_issue(state, issue, attempt, metadata[:worker_host])}
+
+      true ->
+        Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
+
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue.id,
+           attempt + 1,
+           Map.merge(metadata, %{
+             identifier: issue.identifier,
+             error: "no available orchestrator slots"
+           })
+         )}
     end
   end
 
@@ -1307,6 +1330,161 @@ defmodule SymphonyElixir.Orchestrator do
     candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
+
+  defp completed_issue_waiting_for_update?(
+         %Issue{id: issue_id, updated_at: updated_at},
+         %State{completed: completed}
+       )
+       when is_binary(issue_id) do
+    case Map.get(normalize_completed(completed), issue_id) do
+      %{observed_updated_at: nil} -> true
+      %{observed_updated_at: observed_updated_at} -> !issue_updated_after_observed?(updated_at, observed_updated_at)
+      %DateTime{} = completed_at -> !issue_updated_after_completion?(updated_at, completed_at)
+      _ -> false
+    end
+  end
+
+  defp completed_issue_waiting_for_update?(_issue, _state), do: false
+
+  defp issue_updated_after_completion?(%DateTime{} = updated_at, %DateTime{} = completed_at) do
+    DateTime.compare(updated_at, completed_at) == :gt
+  end
+
+  defp issue_updated_after_completion?(_updated_at, _completed_at), do: false
+
+  defp issue_updated_after_observed?(%DateTime{} = updated_at, %DateTime{} = observed_updated_at) do
+    DateTime.compare(updated_at, observed_updated_at) == :gt
+  end
+
+  defp issue_updated_after_observed?(%DateTime{}, :unknown), do: true
+  defp issue_updated_after_observed?(_updated_at, _observed_updated_at), do: false
+
+  defp mark_completed_issue_observed(%State{} = state, %Issue{id: issue_id, updated_at: updated_at})
+       when is_binary(issue_id) do
+    completed = normalize_completed(state.completed)
+
+    completed =
+      case Map.get(completed, issue_id) do
+        %{observed_updated_at: nil} = entry ->
+          Map.put(completed, issue_id, %{entry | observed_updated_at: updated_at || :unknown})
+
+        %DateTime{} = completed_at ->
+          Map.put(completed, issue_id, %{
+            completed_at: completed_at,
+            observed_updated_at: updated_at || :unknown
+          })
+
+        _entry ->
+          completed
+      end
+
+    %{state | completed: completed}
+  end
+
+  defp mark_completed_issue_observed(%State{} = state, _issue), do: state
+
+  defp normalize_completed(%MapSet{} = completed) do
+    completed
+    |> MapSet.to_list()
+    |> Map.new(
+      &{&1,
+       %{
+         completed_at: DateTime.utc_now(),
+         observed_updated_at: nil
+       }}
+    )
+  end
+
+  defp normalize_completed(completed) when is_map(completed), do: completed
+  defp normalize_completed(_completed), do: %{}
+
+  defp ledger_blocks_dispatch?(%Issue{} = issue) do
+    case read_observability_ledger(issue) do
+      %{"state" => "NEEDS HUMAN"} = ledger ->
+        ledger_human_activity_at = parse_ledger_datetime(Map.get(ledger, "last_human_activity_at"))
+        current_human_activity_at = latest_human_activity_at(issue)
+        !human_activity_newer?(current_human_activity_at, ledger_human_activity_at)
+
+      _ledger ->
+        false
+    end
+  end
+
+  defp ledger_blocks_dispatch?(_issue), do: false
+
+  defp read_observability_ledger(%Issue{identifier: identifier}) when is_binary(identifier) and identifier != "" do
+    path = Path.join([dts_logs_root(), "ledger", "#{identifier}.json"])
+
+    with {:ok, body} <- File.read(path),
+         {:ok, ledger} <- Jason.decode(body),
+         true <- is_map(ledger) do
+      ledger
+    else
+      _ -> nil
+    end
+  end
+
+  defp read_observability_ledger(_issue), do: nil
+
+  defp dts_logs_root do
+    # TODO: add a first-class Config field for the observability logs root.
+    case Application.get_env(:symphony_elixir, :log_file) do
+      log_file when is_binary(log_file) ->
+        log_file
+        |> Path.dirname()
+        |> Path.dirname()
+
+      _ ->
+        @default_dts_logs_root
+    end
+  end
+
+  defp latest_human_activity_at(%Issue{comments: comments}) when is_list(comments) do
+    comments
+    |> Enum.reject(&symphony_comment?/1)
+    |> Enum.map(&comment_created_at/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.max_by(&DateTime.to_unix(&1, :microsecond), fn -> nil end)
+  end
+
+  defp latest_human_activity_at(_issue), do: nil
+
+  defp symphony_comment?(comment) do
+    comment
+    |> comment_body()
+    |> case do
+      body when is_binary(body) -> String.starts_with?(body, "## Symphony ")
+      _ -> false
+    end
+  end
+
+  defp comment_body(%{body: body}), do: body
+  defp comment_body(%{"body" => body}), do: body
+  defp comment_body(_comment), do: nil
+
+  defp comment_created_at(%{created_at: %DateTime{} = created_at}), do: created_at
+  defp comment_created_at(%{"created_at" => %DateTime{} = created_at}), do: created_at
+  defp comment_created_at(%{"createdAt" => created_at}), do: parse_ledger_datetime(created_at)
+  defp comment_created_at(%{createdAt: created_at}), do: parse_ledger_datetime(created_at)
+  defp comment_created_at(_comment), do: nil
+
+  defp parse_ledger_datetime(%DateTime{} = datetime), do: datetime
+
+  defp parse_ledger_datetime(value) when is_binary(value) and value != "" do
+    case DateTime.from_iso8601(value) do
+      {:ok, datetime, _offset} -> datetime
+      _ -> nil
+    end
+  end
+
+  defp parse_ledger_datetime(_value), do: nil
+
+  defp human_activity_newer?(%DateTime{} = current, %DateTime{} = ledger) do
+    DateTime.compare(current, ledger) == :gt
+  end
+
+  defp human_activity_newer?(%DateTime{}, nil), do: true
+  defp human_activity_newer?(_current, _ledger), do: false
 
   defp dispatch_slots_available?(%Issue{} = issue, %State{} = state) do
     available_slots(state) > 0 and state_slots_available?(issue, state.running)
