@@ -670,6 +670,61 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, state)
   end
 
+  test "needs-human observability ledger allows dispatch when exact write-scope violation path is named" do
+    with_observability_ledger("MT-1012", %{
+      state: "NEEDS HUMAN",
+      last_human_activity_at: "2026-05-13T21:45:00Z",
+      write_scope_violation: ["lib\\foo.ex"]
+    })
+
+    issue =
+      issue_with_description(
+        "MT-1012",
+        "Updated Goal Contract explicitly names C:\\Users\\Elvis\\Dev\\symphony\\elixir\\lib\\foo.ex."
+      )
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+  end
+
+  test "needs-human observability ledger stays blocked when description names only sibling or parent path" do
+    with_observability_ledger("MT-1013", %{
+      state: "NEEDS HUMAN",
+      last_human_activity_at: "2026-05-13T21:45:00Z",
+      write_scope_violation: ["lib\\foo.ex"]
+    })
+
+    sibling_issue =
+      issue_with_description(
+        "MT-1013",
+        "Updated Goal Contract explicitly names C:\\Users\\Elvis\\Dev\\symphony\\elixir\\lib\\bar.ex."
+      )
+
+    parent_issue =
+      issue_with_description(
+        "MT-1013",
+        "Updated Goal Contract explicitly names C:\\Users\\Elvis\\Dev\\symphony\\elixir\\lib."
+      )
+
+    refute Orchestrator.should_dispatch_issue_for_test(sibling_issue, dispatch_state())
+    refute Orchestrator.should_dispatch_issue_for_test(parent_issue, dispatch_state())
+  end
+
+  test "needs-human observability ledger accepts forward slashes and mixed case for exact path release" do
+    with_observability_ledger("MT-1014", %{
+      state: "NEEDS HUMAN",
+      last_human_activity_at: "2026-05-13T21:45:00Z",
+      write_scope_violation: ["lib\\foo.ex"]
+    })
+
+    issue =
+      issue_with_description(
+        "MT-1014",
+        "Updated Goal Contract explicitly names C:/Users/Elvis/Dev/Symphony/Elixir/Lib/Foo.ex."
+      )
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+  end
+
   test "issue assigned to another worker is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "dev@example.com")
 
@@ -1461,5 +1516,46 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
   defp description_fingerprint(description) do
     :crypto.hash(:sha256, description)
     |> Base.encode16(case: :lower)
+  end
+
+  defp with_observability_ledger(identifier, ledger) do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ledger-write-scope-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    ExUnit.Callbacks.on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    File.write!(Path.join(ledger_root, "#{identifier}.json"), Jason.encode!(ledger))
+  end
+
+  defp dispatch_state do
+    %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+  end
+
+  defp issue_with_description(identifier, description) do
+    %Issue{
+      id: "ledger-write-scope-#{identifier}",
+      identifier: identifier,
+      title: "Needs human with updated write-scope contract",
+      state: "Todo",
+      description: description,
+      comments: [%{body: "Elvis review", created_at: ~U[2026-05-13 21:45:00Z]}]
+    }
   end
 end

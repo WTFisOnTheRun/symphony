@@ -767,6 +767,82 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.claimed, issue_id)
   end
 
+  test "active retry continues when needs-human write-scope violation is resolved by exact path in Goal Contract" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo"],
+      max_concurrent_agents: 1
+    )
+
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ledger-retry-write-scope-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      restore_app_env(:log_file, previous_log_file)
+      File.rm_rf(logs_root)
+    end)
+
+    issue_id = "issue-ledger-retry-write-scope"
+    retry_token = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :LedgerRetryWriteScopeOrchestrator)
+
+    File.write!(
+      Path.join(ledger_root, "MT-562.json"),
+      Jason.encode!(%{
+        state: "NEEDS HUMAN",
+        last_human_activity_at: "2026-05-13T21:45:00Z",
+        write_scope_violation: ["lib\\foo.ex"]
+      })
+    )
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562",
+      state: "Todo",
+      title: "Needs human retry with updated write scope",
+      description: "Updated Goal Contract names C:\\Users\\Elvis\\Dev\\symphony\\elixir\\lib\\foo.ex.",
+      comments: [%{body: "Elvis review", created_at: ~U[2026-05-13 21:45:00Z]}]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{},
+          claimed: MapSet.new(),
+          retry_attempts: %{
+            issue_id => %{
+              attempt: 1,
+              retry_token: retry_token,
+              identifier: "MT-562"
+            }
+          }
+      }
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    assert Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()

@@ -1404,9 +1404,22 @@ defmodule SymphonyElixir.Orchestrator do
         ledger_human_activity_at = parse_ledger_datetime(Map.get(ledger, "last_human_activity_at"))
         current_human_activity_at = latest_human_activity_at(issue)
 
-        not (human_activity_newer?(current_human_activity_at, ledger_human_activity_at) or
-               description_changed_since_needs_human?(issue, ledger) or
-               write_scope_violation_resolved_by_description?(issue, ledger))
+        cond do
+          human_activity_newer?(current_human_activity_at, ledger_human_activity_at) ->
+            log_needs_human_ledger_bypass(issue, "newer human activity")
+            false
+
+          description_changed_since_needs_human?(issue, ledger) ->
+            log_needs_human_ledger_bypass(issue, "Goal Contract description changed")
+            false
+
+          write_scope_violation_resolved_by_description?(issue, ledger) ->
+            log_needs_human_ledger_bypass(issue, "Goal Contract names prior write-scope violation paths")
+            false
+
+          true ->
+            true
+        end
 
       _ledger ->
         false
@@ -1414,6 +1427,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp ledger_blocks_dispatch?(_issue), do: false
+
+  defp log_needs_human_ledger_bypass(%Issue{} = issue, reason) do
+    Logger.info("Allowing dispatch for #{issue_context(issue)} despite NEEDS HUMAN observability ledger; #{reason}")
+  end
 
   defp read_observability_ledger(%Issue{identifier: identifier}) when is_binary(identifier) and identifier != "" do
     path = Path.join([dts_logs_root(), "ledger", "#{identifier}.json"])
