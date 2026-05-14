@@ -624,6 +624,52 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue_without_ledger, state)
   end
 
+  test "needs-human observability ledger allows dispatch when the Goal Contract description changed" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ledger-description-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    File.write!(
+      Path.join(ledger_root, "MT-1011.json"),
+      Jason.encode!(%{
+        state: "NEEDS HUMAN",
+        last_human_activity_at: "2026-05-13T21:45:00Z",
+        needs_human_issue_description_fingerprint: description_fingerprint("Old Goal Contract")
+      })
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 3,
+      running: %{},
+      claimed: MapSet.new(),
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      retry_attempts: %{}
+    }
+
+    issue = %Issue{
+      id: "ledger-description-1",
+      identifier: "MT-1011",
+      title: "Needs human with updated contract",
+      state: "Todo",
+      description: "Updated Goal Contract names the prior blocker path.",
+      comments: [%{body: "Elvis review", created_at: ~U[2026-05-13 21:45:00Z]}]
+    }
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
   test "issue assigned to another worker is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "dev@example.com")
 
@@ -1410,5 +1456,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp description_fingerprint(description) do
+    :crypto.hash(:sha256, description)
+    |> Base.encode16(case: :lower)
   end
 end

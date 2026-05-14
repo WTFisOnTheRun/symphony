@@ -1403,7 +1403,10 @@ defmodule SymphonyElixir.Orchestrator do
       %{"state" => "NEEDS HUMAN"} = ledger ->
         ledger_human_activity_at = parse_ledger_datetime(Map.get(ledger, "last_human_activity_at"))
         current_human_activity_at = latest_human_activity_at(issue)
-        !human_activity_newer?(current_human_activity_at, ledger_human_activity_at)
+
+        not (human_activity_newer?(current_human_activity_at, ledger_human_activity_at) or
+               description_changed_since_needs_human?(issue, ledger) or
+               write_scope_violation_resolved_by_description?(issue, ledger))
 
       _ledger ->
         false
@@ -1448,6 +1451,77 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp latest_human_activity_at(_issue), do: nil
+
+  defp description_changed_since_needs_human?(%Issue{description: description}, ledger)
+       when is_binary(description) do
+    case Map.get(ledger, "needs_human_issue_description_fingerprint") do
+      fingerprint when is_binary(fingerprint) and fingerprint != "" ->
+        description_fingerprint(description) != fingerprint
+
+      _ ->
+        false
+    end
+  end
+
+  defp description_changed_since_needs_human?(_issue, _ledger), do: false
+
+  defp write_scope_violation_resolved_by_description?(%Issue{description: description}, ledger)
+       when is_binary(description) do
+    paths =
+      ledger
+      |> Map.get("write_scope_violation", [])
+      |> List.wrap()
+      |> Enum.filter(&is_binary/1)
+      |> Enum.reject(&(String.trim(&1) == ""))
+
+    paths != [] and Enum.all?(paths, &description_names_elixir_path?(description, &1))
+  end
+
+  defp write_scope_violation_resolved_by_description?(_issue, _ledger), do: false
+
+  defp description_names_elixir_path?(description, path) do
+    normalized_description = String.replace(description, "/", "\\")
+    relative_path = normalize_elixir_path(path)
+
+    relative_path != "" and
+      Regex.match?(
+        ~r/(^|[^A-Za-z0-9_.-])#{Regex.escape(relative_path)}(?=$|[^A-Za-z0-9_.-]|\.(?=$|\s))/i,
+        normalized_description
+      )
+  end
+
+  defp normalize_elixir_path(path) when is_binary(path) do
+    normalized =
+      path
+      |> String.trim()
+      |> String.trim("\"'`<>)]}. ,;:")
+      |> String.replace("/", "\\")
+      |> String.trim_leading(".")
+      |> String.trim_leading("\\")
+
+    marker = "symphony\\elixir\\"
+    lower = String.downcase(normalized)
+
+    case :binary.matches(lower, marker) do
+      [] ->
+        normalized
+
+      matches ->
+        {index, _length} = List.last(matches)
+        String.slice(normalized, (index + byte_size(marker))..-1//1)
+    end
+  end
+
+  defp normalize_elixir_path(_path), do: ""
+
+  defp description_fingerprint(description) when is_binary(description) do
+    description
+    |> String.downcase()
+    |> String.replace(~r/\s+/, " ")
+    |> String.trim()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
 
   defp symphony_comment?(comment) do
     comment
