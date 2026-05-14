@@ -12,6 +12,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @default_windows_mise_package "jdx.mise_Microsoft.Winget.Source_8wekyb3d8bbwe"
+  @default_windows_codex_args ["app-server", "--listen", "stdio://"]
+  @default_git_path_entries ["C:/Program Files/Git/cmd", "C:/Program Files/Git/usr/bin"]
 
   @type session :: %{
           port: port(),
@@ -142,6 +145,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
+    :ok
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -187,22 +191,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp start_port(workspace, nil) do
-    executable = System.find_executable("bash")
+    with {:ok, launch_spec} <- local_launch_spec(workspace, Config.settings!(), windows?()) do
+      Logger.info("Starting local Codex app-server via #{launch_spec.mode} launcher executable=#{launch_spec.executable}")
 
-    if is_nil(executable) do
-      {:error, :bash_not_found}
-    else
       port =
         Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
+          {:spawn_executable, String.to_charlist(launch_spec.executable)},
+          port_options_for_launch(workspace, launch_spec)
         )
 
       {:ok, port}
@@ -221,6 +216,321 @@ defmodule SymphonyElixir.Codex.AppServer do
     ]
     |> Enum.join(" && ")
   end
+
+  @doc false
+  @spec local_launch_spec_for_test(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def local_launch_spec_for_test(workspace \\ File.cwd!(), opts \\ []) do
+    settings = Keyword.get(opts, :settings, Config.settings!())
+    local_launch_spec(workspace, settings, Keyword.get(opts, :windows?, windows?()))
+  end
+
+  @doc false
+  @spec windows_runtime_env_for_test(keyword()) :: map()
+  def windows_runtime_env_for_test(opts \\ []) do
+    settings = Keyword.get(opts, :settings, Config.settings!())
+    windows_runtime_env(settings)
+  end
+
+  @spec runtime_preflight(Path.t()) :: {:ok, String.t()} | {:error, term()}
+  def runtime_preflight(workspace \\ File.cwd!()) do
+    settings = Config.settings!()
+
+    with {:ok, mise_executable} <- resolve_windows_mise_executable(settings) do
+      env = windows_runtime_env(settings) |> env_for_system_cmd()
+
+      case System.cmd(mise_executable, ["exec", "--", "mix", "--version"],
+             cd: workspace,
+             env: env,
+             stderr_to_stdout: true
+           ) do
+        {output, 0} ->
+          Logger.info("Codex child runtime preflight passed using mise=#{mise_executable}")
+          {:ok, String.trim(output)}
+
+        {output, status} ->
+          {:error, {:runtime_preflight_failed, status, String.slice(output, 0, 2_000)}}
+      end
+    end
+  end
+
+  @doc false
+  @spec runtime_preflight_for_test(Path.t()) :: {:ok, String.t()} | {:error, term()}
+  def runtime_preflight_for_test(workspace \\ File.cwd!()), do: runtime_preflight(workspace)
+
+  @doc false
+  @spec runtime_preflight_command_for_test(Path.t(), keyword()) :: {:ok, map()} | {:error, term()}
+  def runtime_preflight_command_for_test(workspace \\ File.cwd!(), opts \\ []) do
+    settings = Keyword.get(opts, :settings, Config.settings!())
+
+    with {:ok, mise_executable} <- resolve_windows_mise_executable(settings) do
+      {:ok,
+       %{
+         executable: mise_executable,
+         args: ["exec", "--", "mix", "--version"],
+         cd: workspace,
+         env: windows_runtime_env(settings)
+       }}
+    end
+  end
+
+  defp local_launch_spec(_workspace, settings, true) do
+    cond do
+      direct_executable_configured?(settings) ->
+        direct_windows_launch_spec(settings)
+
+      default_windows_codex_command?(settings) and File.exists?(default_windows_codex_executable()) ->
+        direct_windows_launch_spec(%{settings | codex: %{settings.codex | executable: default_windows_codex_executable()}})
+
+      true ->
+        shell_launch_spec(settings)
+    end
+  end
+
+  defp local_launch_spec(_workspace, settings, _windows?), do: shell_launch_spec(settings)
+
+  defp direct_windows_launch_spec(settings) do
+    executable = settings.codex.executable || default_windows_codex_executable()
+
+    cond do
+      is_nil(executable) or String.trim(executable) == "" ->
+        {:error, :codex_executable_not_configured}
+
+      not File.exists?(executable) ->
+        {:error, {:codex_executable_not_found, executable}}
+
+      not windows_executable?(executable) ->
+        {:error, {:codex_executable_not_windows_exe, executable}}
+
+      true ->
+        {:ok,
+         %{
+           mode: :direct,
+           executable: executable,
+           args: codex_args(settings),
+           env: windows_runtime_env(settings)
+         }}
+    end
+  end
+
+  defp shell_launch_spec(settings) do
+    executable = System.find_executable("bash")
+
+    if is_nil(executable) do
+      {:error, :bash_not_found}
+    else
+      {:ok,
+       %{
+         mode: :shell,
+         executable: executable,
+         args: ["-lc", settings.codex.command],
+         env: %{}
+       }}
+    end
+  end
+
+  defp port_options_for_launch(workspace, %{args: args, env: env}) do
+    options = [
+      :binary,
+      :exit_status,
+      :stderr_to_stdout,
+      args: Enum.map(args, &String.to_charlist/1),
+      cd: String.to_charlist(workspace),
+      line: @port_line_bytes
+    ]
+
+    if map_size(env) == 0 do
+      options
+    else
+      Keyword.put(options, :env, env_for_port(env))
+    end
+  end
+
+  defp direct_executable_configured?(settings) do
+    is_binary(settings.codex.executable) and String.trim(settings.codex.executable) != ""
+  end
+
+  defp default_windows_codex_command?(settings) do
+    String.trim(settings.codex.command || "") == "codex app-server"
+  end
+
+  defp codex_args(settings) do
+    case settings.codex.args do
+      args when is_list(args) and args != [] -> args
+      _ -> @default_windows_codex_args
+    end
+  end
+
+  defp windows_executable?(path) do
+    path
+    |> Path.extname()
+    |> String.downcase()
+    |> Kernel.==(".exe")
+  end
+
+  defp windows_runtime_env(settings) do
+    path_entries = windows_runtime_path_entries(settings)
+    path_value = Enum.join(path_entries, ";")
+
+    settings.codex.env
+    |> string_env_map()
+    |> maybe_put_env("PATH", path_value)
+    |> maybe_put_env("Path", path_value)
+    |> maybe_put_env("ERL_ROOTDIR", discover_tool_install_root("erlang", "28.5"))
+    |> maybe_put_env("ERLANG_HOME", discover_tool_install_root("erlang", "28.5"))
+    |> maybe_put_env("ELIXIR_HOME", discover_tool_install_root("elixir", "1.19.5-otp-28"))
+  end
+
+  defp windows_runtime_path_entries(settings) do
+    configured = settings.codex.path_entries || []
+
+    configured
+    |> Kernel.++(default_windows_runtime_path_entries())
+    |> Kernel.++(current_process_path_entries())
+    |> existing_unique_path_entries()
+  end
+
+  defp default_windows_runtime_path_entries do
+    local_appdata = local_appdata_root()
+    codex_dir = Path.dirname(default_windows_codex_executable())
+    erlang_root = discover_tool_install_root("erlang", "28.5")
+    elixir_root = discover_tool_install_root("elixir", "1.19.5-otp-28")
+
+    ([
+       default_windows_mise_bin(),
+       codex_dir
+     ] ++
+       @default_git_path_entries ++
+       [
+         if(erlang_root, do: Path.join(erlang_root, "bin")),
+         erlang_erts_bin(erlang_root),
+         if(elixir_root, do: Path.join(elixir_root, "bin")),
+         Path.join(local_appdata, "Microsoft/WinGet/Packages/OpenAI.Codex_Microsoft.Winget.Source_8wekyb3d8bbwe")
+       ])
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp resolve_windows_mise_executable(settings) do
+    candidates =
+      [
+        Path.join(default_windows_mise_bin(), "mise.exe")
+      ] ++
+        Enum.map(settings.codex.path_entries || [], &Path.join(&1, "mise.exe")) ++
+        Enum.map(settings.codex.path_entries || [], &Path.join(&1, "mise.cmd"))
+
+    case Enum.find(candidates, &File.exists?/1) do
+      nil ->
+        case System.find_executable("mise") do
+          nil -> {:error, :mise_executable_not_found}
+          executable -> {:ok, executable}
+        end
+
+      executable ->
+        {:ok, executable}
+    end
+  end
+
+  defp default_windows_codex_executable do
+    Path.join(local_appdata_root(), "OpenAI/Codex/bin/codex.exe")
+  end
+
+  defp default_windows_mise_bin do
+    Path.join(local_appdata_root(), "Microsoft/WinGet/Packages/#{@default_windows_mise_package}/mise/bin")
+  end
+
+  defp local_appdata_root do
+    System.get_env("LOCALAPPDATA") || Path.join(System.user_home!(), "AppData/Local")
+  end
+
+  defp discover_tool_install_root(tool, preferred_version) do
+    root = Path.join(local_appdata_root(), "mise/installs/#{tool}")
+    preferred = Path.join(root, preferred_version)
+
+    cond do
+      File.dir?(preferred) ->
+        preferred
+
+      File.dir?(root) ->
+        root
+        |> File.ls!()
+        |> Enum.map(&Path.join(root, &1))
+        |> Enum.filter(&File.dir?/1)
+        |> Enum.sort(:desc)
+        |> List.first()
+
+      true ->
+        nil
+    end
+  end
+
+  defp erlang_erts_bin(nil), do: nil
+
+  defp erlang_erts_bin(erlang_root) do
+    if File.dir?(erlang_root) do
+      erlang_root
+      |> File.ls!()
+      |> Enum.filter(&String.starts_with?(&1, "erts-"))
+      |> Enum.map(&Path.join([erlang_root, &1, "bin"]))
+      |> Enum.filter(&File.dir?/1)
+      |> Enum.sort(:desc)
+      |> List.first()
+    end
+  end
+
+  defp current_process_path_entries do
+    ["Path", "PATH"]
+    |> Enum.find_value(fn key ->
+      case System.get_env(key) do
+        value when is_binary(value) and value != "" -> String.split(value, ";", trim: true)
+        _ -> nil
+      end
+    end) || []
+  end
+
+  defp existing_unique_path_entries(entries) do
+    entries
+    |> Enum.filter(&is_binary/1)
+    |> Enum.map(&Path.expand/1)
+    |> Enum.filter(&File.dir?/1)
+    |> Enum.reduce({MapSet.new(), []}, fn entry, {seen, acc} ->
+      key = entry |> String.replace("\\", "/") |> String.downcase()
+
+      if MapSet.member?(seen, key) do
+        {seen, acc}
+      else
+        {MapSet.put(seen, key), [entry | acc]}
+      end
+    end)
+    |> elem(1)
+    |> Enum.reverse()
+  end
+
+  defp string_env_map(env) when is_map(env) do
+    Enum.reduce(env, %{}, fn {key, value}, acc ->
+      if is_binary(value) do
+        Map.put(acc, to_string(key), value)
+      else
+        acc
+      end
+    end)
+  end
+
+  defp string_env_map(_env), do: %{}
+
+  defp maybe_put_env(env, _key, nil), do: env
+  defp maybe_put_env(env, _key, ""), do: env
+  defp maybe_put_env(env, key, value), do: Map.put(env, key, value)
+
+  defp env_for_port(env) when map_size(env) == 0, do: []
+
+  defp env_for_port(env) do
+    Enum.map(env, fn {key, value} -> {String.to_charlist(key), String.to_charlist(value)} end)
+  end
+
+  defp env_for_system_cmd(env) do
+    Enum.map(env, fn {key, value} -> {key, value} end)
+  end
+
+  defp windows?, do: match?({:win32, _}, :os.type())
 
   defp port_metadata(port, worker_host) when is_port(port) do
     base_metadata =

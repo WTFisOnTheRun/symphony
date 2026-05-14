@@ -108,12 +108,20 @@ defmodule SymphonyElixir.TestSupport do
           max_retry_backoff_ms: 300_000,
           max_concurrent_agents_by_state: %{},
           codex_command: "codex app-server",
+          codex_executable: nil,
+          codex_args: nil,
+          codex_env: %{},
+          codex_path_entries: [],
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
           codex_turn_sandbox_policy: nil,
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_fuse_warning_tokens: 1_000_000,
+          codex_fuse_no_progress_tokens: 2_000_000,
+          codex_fuse_no_progress_ms: 600_000,
+          codex_fuse_hard_tokens: 4_000_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -145,12 +153,20 @@ defmodule SymphonyElixir.TestSupport do
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     codex_command = Keyword.get(config, :codex_command)
+    codex_executable = Keyword.get(config, :codex_executable)
+    codex_args = Keyword.get(config, :codex_args)
+    codex_env = Keyword.get(config, :codex_env)
+    codex_path_entries = Keyword.get(config, :codex_path_entries)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
     codex_turn_sandbox_policy = Keyword.get(config, :codex_turn_sandbox_policy)
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_fuse_warning_tokens = Keyword.get(config, :codex_fuse_warning_tokens)
+    codex_fuse_no_progress_tokens = Keyword.get(config, :codex_fuse_no_progress_tokens)
+    codex_fuse_no_progress_ms = Keyword.get(config, :codex_fuse_no_progress_ms)
+    codex_fuse_hard_tokens = Keyword.get(config, :codex_fuse_hard_tokens)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -186,12 +202,20 @@ defmodule SymphonyElixir.TestSupport do
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
+        "  executable: #{yaml_value(codex_executable)}",
+        "  args: #{yaml_value(codex_args)}",
+        "  env: #{yaml_value(codex_env)}",
+        "  path_entries: #{yaml_value(codex_path_entries)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
         "  thread_sandbox: #{yaml_value(codex_thread_sandbox)}",
         "  turn_sandbox_policy: #{yaml_value(codex_turn_sandbox_policy)}",
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "  fuse_warning_tokens: #{yaml_value(codex_fuse_warning_tokens)}",
+        "  fuse_no_progress_tokens: #{yaml_value(codex_fuse_no_progress_tokens)}",
+        "  fuse_no_progress_ms: #{yaml_value(codex_fuse_no_progress_ms)}",
+        "  fuse_hard_tokens: #{yaml_value(codex_fuse_hard_tokens)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -204,7 +228,12 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+
+    "\"" <> escaped <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)

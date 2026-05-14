@@ -76,6 +76,175 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "windows launcher chooses codex.exe over codex.ps1 and bypasses bash" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-launcher-#{System.unique_integer([:positive])}"
+      )
+
+    previous_local_appdata = System.get_env("LOCALAPPDATA")
+    previous_appdata = System.get_env("APPDATA")
+    previous_path = System.get_env("Path") || System.get_env("PATH")
+
+    try do
+      local_appdata = Path.join(test_root, "localappdata")
+      appdata = Path.join(test_root, "appdata")
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1002")
+      codex_exe = Path.join(local_appdata, "OpenAI/Codex/bin/codex.exe")
+      codex_ps1 = Path.join(appdata, "npm/codex.ps1")
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.dirname(codex_exe))
+      File.mkdir_p!(Path.dirname(codex_ps1))
+      File.write!(codex_exe, "fake codex exe")
+      File.write!(codex_ps1, "fake codex ps1")
+
+      System.put_env("LOCALAPPDATA", local_appdata)
+      System.put_env("APPDATA", appdata)
+      System.put_env("Path", Path.dirname(codex_ps1))
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "codex app-server"
+      )
+
+      assert {:ok, launch_spec} = AppServer.local_launch_spec_for_test(workspace, windows?: true)
+      assert launch_spec.mode == :direct
+      assert launch_spec.executable == codex_exe
+      assert launch_spec.args == ["app-server", "--listen", "stdio://"]
+      refute launch_spec.args == ["-lc", "codex app-server"]
+    after
+      restore_env("LOCALAPPDATA", previous_local_appdata)
+      restore_env("APPDATA", previous_appdata)
+      restore_env("Path", previous_path)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "windows launcher env contains deterministic runtime path entries without duplicates" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-env-#{System.unique_integer([:positive])}"
+      )
+
+    previous_local_appdata = System.get_env("LOCALAPPDATA")
+    previous_path = System.get_env("Path") || System.get_env("PATH")
+
+    try do
+      local_appdata = Path.join(test_root, "localappdata")
+      configured_bin = Path.join(test_root, "configured-bin")
+
+      mise_bin =
+        Path.join(
+          local_appdata,
+          "Microsoft/WinGet/Packages/jdx.mise_Microsoft.Winget.Source_8wekyb3d8bbwe/mise/bin"
+        )
+
+      codex_bin = Path.join(local_appdata, "OpenAI/Codex/bin")
+      erlang_bin = Path.join(local_appdata, "mise/installs/erlang/28.5/bin")
+      erlang_erts_bin = Path.join(local_appdata, "mise/installs/erlang/28.5/erts-16.4/bin")
+      elixir_bin = Path.join(local_appdata, "mise/installs/elixir/1.19.5-otp-28/bin")
+
+      Enum.each([configured_bin, mise_bin, codex_bin, erlang_bin, erlang_erts_bin, elixir_bin], &File.mkdir_p!/1)
+      System.put_env("LOCALAPPDATA", local_appdata)
+      System.put_env("Path", configured_bin)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        codex_path_entries: [configured_bin, configured_bin]
+      )
+
+      env = AppServer.windows_runtime_env_for_test()
+      path_entries = String.split(env["Path"], ";", trim: true)
+      normalized_entries = Enum.map(path_entries, &normalize_windows_test_path/1)
+
+      assert normalize_windows_test_path(configured_bin) in normalized_entries
+      assert normalize_windows_test_path(mise_bin) in normalized_entries
+      assert normalize_windows_test_path(codex_bin) in normalized_entries
+      assert normalize_windows_test_path(erlang_bin) in normalized_entries
+      assert normalize_windows_test_path(erlang_erts_bin) in normalized_entries
+      assert normalize_windows_test_path(elixir_bin) in normalized_entries
+      assert Enum.count(normalized_entries, &(&1 == normalize_windows_test_path(configured_bin))) == 1
+      assert env["ERL_ROOTDIR"] == Path.join(local_appdata, "mise/installs/erlang/28.5")
+      assert env["ELIXIR_HOME"] == Path.join(local_appdata, "mise/installs/elixir/1.19.5-otp-28")
+    after
+      restore_env("LOCALAPPDATA", previous_local_appdata)
+      restore_env("Path", previous_path)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "windows launcher rejects configured codex.ps1 for direct launch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-windows-launcher-ps1-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace = Path.join(test_root, "workspaces/MT-1003")
+      codex_ps1 = Path.join(test_root, "appdata/npm/codex.ps1")
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.dirname(codex_ps1))
+      File.write!(codex_ps1, "fake codex ps1")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        codex_executable: codex_ps1,
+        codex_args: ["app-server", "--listen", "stdio://"]
+      )
+
+      assert {:error, {:codex_executable_not_windows_exe, ^codex_ps1}} =
+               AppServer.local_launch_spec_for_test(workspace, windows?: true)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime preflight command uses resolved mise executable and mix through mise exec" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-preflight-command-#{System.unique_integer([:positive])}"
+      )
+
+    previous_local_appdata = System.get_env("LOCALAPPDATA")
+
+    try do
+      local_appdata = Path.join(test_root, "localappdata")
+      workspace = Path.join(test_root, "elixir")
+
+      mise_exe =
+        Path.join(
+          local_appdata,
+          "Microsoft/WinGet/Packages/jdx.mise_Microsoft.Winget.Source_8wekyb3d8bbwe/mise/bin/mise.exe"
+        )
+
+      File.mkdir_p!(workspace)
+      File.mkdir_p!(Path.dirname(mise_exe))
+      File.write!(mise_exe, "fake mise exe")
+      System.put_env("LOCALAPPDATA", local_appdata)
+
+      write_workflow_file!(Workflow.workflow_file_path())
+
+      assert {:ok, command} = AppServer.runtime_preflight_command_for_test(workspace)
+      assert command.executable == mise_exe
+      assert command.args == ["exec", "--", "mix", "--version"]
+      assert command.cd == workspace
+    after
+      restore_env("LOCALAPPDATA", previous_local_appdata)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp normalize_windows_test_path(path) do
+    path
+    |> String.replace("\\", "/")
+    |> String.downcase()
+  end
+
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(

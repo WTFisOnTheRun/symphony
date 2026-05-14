@@ -15,6 +15,8 @@ defmodule SymphonyElixir.Orchestrator do
   @default_dts_logs_root "C:/Users/Elvis/Dev/dts-symphony-runner-logs"
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @durable_workspace_extensions [".md", ".txt", ".json", ".html", ".png", ".jpg", ".jpeg", ".webp", ".log"]
+  @durable_workspace_ignored_files MapSet.new(["README.md", "WORKFLOW.md"])
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
@@ -175,6 +177,7 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_initialize_workspace_progress_signature()
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -274,7 +277,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_running_issues(%State{} = state) do
-    state = reconcile_stalled_running_issues(state)
+    state =
+      state
+      |> reconcile_runaway_running_issues()
+      |> reconcile_stalled_running_issues()
+
     running_ids = Map.keys(state.running)
 
     if running_ids == [] do
@@ -312,6 +319,18 @@ defmodule SymphonyElixir.Orchestrator do
   @spec should_dispatch_issue_for_test(Issue.t(), term()) :: boolean()
   def should_dispatch_issue_for_test(%Issue{} = issue, %State{} = state) do
     should_dispatch_issue?(issue, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec integrate_codex_update_for_test(map(), map()) :: {map(), map()}
+  def integrate_codex_update_for_test(running_entry, update) when is_map(running_entry) and is_map(update) do
+    integrate_codex_update(running_entry, update)
+  end
+
+  @doc false
+  @spec reconcile_runaway_running_issues_for_test(State.t(), DateTime.t()) :: State.t()
+  def reconcile_runaway_running_issues_for_test(%State{} = state, %DateTime{} = now) do
+    reconcile_runaway_running_issues(state, now)
   end
 
   @doc false
@@ -443,6 +462,204 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         release_issue_claim(state, issue_id)
+    end
+  end
+
+  defp reconcile_runaway_running_issues(%State{} = state, now \\ DateTime.utc_now()) do
+    codex = Config.settings!().codex
+
+    Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+      running_entry = refresh_workspace_durable_progress(running_entry, now)
+      state_acc = %{state_acc | running: Map.put(state_acc.running, issue_id, running_entry)}
+
+      case runaway_fuse_reason(running_entry, now, codex) do
+        nil ->
+          maybe_log_runaway_warning(state_acc, issue_id, running_entry, codex)
+
+        reason ->
+          trip_runaway_fuse(state_acc, issue_id, running_entry, reason, now)
+      end
+    end)
+  end
+
+  defp maybe_log_runaway_warning(state, issue_id, running_entry, codex) do
+    warning_tokens = Map.get(codex, :fuse_warning_tokens, 0)
+    tokens_since_progress = tokens_since_durable_progress(running_entry)
+
+    if warning_tokens > 0 and tokens_since_progress >= warning_tokens and
+         Map.get(running_entry, :fuse_warning_emitted) != true do
+      identifier = Map.get(running_entry, :identifier, issue_id)
+
+      Logger.warning("Issue approaching no-progress token fuse: issue_id=#{issue_id} issue_identifier=#{identifier} tokens_since_progress=#{tokens_since_progress}")
+
+      put_in(state.running[issue_id][:fuse_warning_emitted], true)
+    else
+      state
+    end
+  end
+
+  defp runaway_fuse_reason(running_entry, now, codex) do
+    total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
+    hard_tokens = Map.get(codex, :fuse_hard_tokens, 0)
+    no_progress_tokens = Map.get(codex, :fuse_no_progress_tokens, 0)
+    no_progress_ms = Map.get(codex, :fuse_no_progress_ms, 0)
+    tokens_since_progress = tokens_since_durable_progress(running_entry)
+    elapsed_ms = durable_progress_elapsed_ms(running_entry, now)
+
+    cond do
+      hard_tokens > 0 and total_tokens >= hard_tokens ->
+        {:hard_token_fuse, total_tokens}
+
+      no_progress_tokens > 0 and tokens_since_progress >= no_progress_tokens ->
+        {:no_progress_token_fuse, tokens_since_progress}
+
+      no_progress_ms > 0 and is_integer(elapsed_ms) and elapsed_ms >= no_progress_ms ->
+        {:no_progress_time_fuse, elapsed_ms}
+
+      true ->
+        nil
+    end
+  end
+
+  defp trip_runaway_fuse(state, issue_id, running_entry, reason, now) do
+    identifier = Map.get(running_entry, :identifier, issue_id)
+    fingerprint = runaway_fuse_fingerprint(identifier, reason)
+    message = runaway_fuse_message(reason)
+
+    Logger.error("Issue stopped by runaway token/progress fuse: issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)} session_id=#{running_entry_session_id(running_entry)}")
+
+    state
+    |> terminate_running_issue(issue_id, false)
+    |> put_completed_blocker(issue_id, running_entry, %{
+      state: "NEEDS HUMAN",
+      phase: "runaway token/progress fuse",
+      error: message,
+      blocker_reason: message,
+      blocker_fingerprint: fingerprint,
+      next_human_action: "Repair the runner child-runtime/preflight or update the Goal Contract with an explicit opt-out before rerun.",
+      completed_at: now
+    })
+  end
+
+  defp put_completed_blocker(%State{} = state, issue_id, running_entry, metadata) do
+    entry =
+      Map.merge(
+        %{
+          completed_at: DateTime.utc_now(),
+          observed_updated_at: nil,
+          identifier: Map.get(running_entry, :identifier),
+          issue: Map.get(running_entry, :issue),
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path),
+          session_id: Map.get(running_entry, :session_id),
+          codex_total_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+          codex_input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+          codex_output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+          turn_count: Map.get(running_entry, :turn_count, 0),
+          last_codex_event: Map.get(running_entry, :last_codex_event),
+          last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp),
+          last_codex_message: Map.get(running_entry, :last_codex_message),
+          started_at: Map.get(running_entry, :started_at)
+        },
+        metadata
+      )
+
+    %{state | completed: Map.put(normalize_completed(state.completed), issue_id, entry)}
+  end
+
+  defp runaway_fuse_fingerprint(identifier, reason) do
+    value = "#{identifier}|#{inspect(reason)}"
+
+    :crypto.hash(:sha256, value)
+    |> Base.encode16(case: :lower)
+  end
+
+  defp runaway_fuse_message({:hard_token_fuse, total_tokens}) do
+    "Hard token fuse tripped at #{total_tokens} total tokens in one turn."
+  end
+
+  defp runaway_fuse_message({:no_progress_token_fuse, tokens}) do
+    "No durable progress after #{tokens} additional tokens."
+  end
+
+  defp runaway_fuse_message({:no_progress_time_fuse, elapsed_ms}) do
+    "No durable progress for #{elapsed_ms}ms."
+  end
+
+  defp tokens_since_durable_progress(running_entry) do
+    max(
+      0,
+      Map.get(running_entry, :codex_total_tokens, 0) -
+        Map.get(running_entry, :last_durable_progress_tokens, 0)
+    )
+  end
+
+  defp durable_progress_elapsed_ms(running_entry, now) do
+    case Map.get(running_entry, :last_durable_progress_at) || Map.get(running_entry, :started_at) do
+      %DateTime{} = timestamp -> max(0, DateTime.diff(now, timestamp, :millisecond))
+      _ -> nil
+    end
+  end
+
+  defp refresh_workspace_durable_progress(running_entry, now) when is_map(running_entry) do
+    case workspace_progress_signature(Map.get(running_entry, :workspace_path)) do
+      nil ->
+        running_entry
+
+      signature ->
+        if signature != Map.get(running_entry, :durable_workspace_signature) do
+          Map.merge(running_entry, %{
+            durable_workspace_signature: signature,
+            last_durable_progress_at: now,
+            last_durable_progress_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+            last_durable_progress_source: :workspace_evidence
+          })
+        else
+          running_entry
+        end
+    end
+  end
+
+  defp refresh_workspace_durable_progress(running_entry, _now), do: running_entry
+
+  defp maybe_initialize_workspace_progress_signature(running_entry) when is_map(running_entry) do
+    case workspace_progress_signature(Map.get(running_entry, :workspace_path)) do
+      nil -> running_entry
+      signature -> Map.put_new(running_entry, :durable_workspace_signature, signature)
+    end
+  end
+
+  defp maybe_initialize_workspace_progress_signature(running_entry), do: running_entry
+
+  defp workspace_progress_signature(nil), do: nil
+
+  defp workspace_progress_signature(workspace_path) when is_binary(workspace_path) do
+    if File.dir?(workspace_path) do
+      workspace_path
+      |> Path.join("*")
+      |> Path.wildcard()
+      |> Enum.filter(&durable_workspace_file?/1)
+      |> Enum.map(&workspace_file_signature/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.sort()
+      |> :erlang.term_to_binary()
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+    end
+  end
+
+  defp workspace_progress_signature(_workspace_path), do: nil
+
+  defp durable_workspace_file?(path) do
+    File.regular?(path) and
+      Path.extname(path) in @durable_workspace_extensions and
+      not MapSet.member?(@durable_workspace_ignored_files, Path.basename(path))
+  end
+
+  defp workspace_file_signature(path) do
+    case File.stat(path, time: :posix) do
+      {:ok, stat} -> {Path.basename(path), stat.size, stat.mtime}
+      _ -> nil
     end
   end
 
@@ -723,7 +940,12 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: DateTime.utc_now(),
+            last_durable_progress_at: DateTime.utc_now(),
+            last_durable_progress_tokens: 0,
+            last_durable_progress_source: :dispatch,
+            durable_workspace_signature: nil,
+            fuse_warning_emitted: false
           })
 
         %{
@@ -1163,10 +1385,45 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    blocked =
+      state.completed
+      |> normalize_completed()
+      |> Enum.flat_map(fn
+        {issue_id, %{state: "NEEDS HUMAN"} = entry} ->
+          [
+            %{
+              issue_id: issue_id,
+              issue_identifier: Map.get(entry, :identifier),
+              state: Map.get(entry, :state),
+              phase: Map.get(entry, :phase),
+              worker_host: Map.get(entry, :worker_host),
+              workspace_path: Map.get(entry, :workspace_path),
+              session_id: Map.get(entry, :session_id),
+              codex_input_tokens: Map.get(entry, :codex_input_tokens, 0),
+              codex_output_tokens: Map.get(entry, :codex_output_tokens, 0),
+              codex_total_tokens: Map.get(entry, :codex_total_tokens, 0),
+              turn_count: Map.get(entry, :turn_count, 0),
+              started_at: Map.get(entry, :started_at),
+              completed_at: Map.get(entry, :completed_at),
+              last_event: Map.get(entry, :last_codex_event),
+              last_event_at: Map.get(entry, :last_codex_timestamp),
+              last_message: Map.get(entry, :last_codex_message),
+              error: Map.get(entry, :error),
+              blocker_reason: Map.get(entry, :blocker_reason),
+              blocker_fingerprint: Map.get(entry, :blocker_fingerprint),
+              next_human_action: Map.get(entry, :next_human_action)
+            }
+          ]
+
+        _ ->
+          []
+      end)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
+       blocked: blocked,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1203,7 +1460,7 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
 
-    {
+    updated_entry =
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarize_codex_update(update),
@@ -1217,10 +1474,24 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
-      }),
+      })
+
+    {
+      maybe_mark_durable_codex_progress(updated_entry, event, timestamp),
       token_delta
     }
   end
+
+  defp maybe_mark_durable_codex_progress(running_entry, event, %DateTime{} = timestamp)
+       when event in [:turn_completed, :turn_failed, :turn_cancelled, :turn_ended_with_error] do
+    Map.merge(running_entry, %{
+      last_durable_progress_at: timestamp,
+      last_durable_progress_tokens: Map.get(running_entry, :codex_total_tokens, 0),
+      last_durable_progress_source: event
+    })
+  end
+
+  defp maybe_mark_durable_codex_progress(running_entry, _event, _timestamp), do: running_entry
 
   defp codex_app_server_pid_for_update(_existing, %{codex_app_server_pid: pid})
        when is_binary(pid),

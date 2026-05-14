@@ -158,6 +158,10 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:command, :string, default: "codex app-server")
+      field(:executable, :string)
+      field(:args, {:array, :string})
+      field(:env, :map, default: %{})
+      field(:path_entries, {:array, :string}, default: [])
 
       field(:approval_policy, StringOrMap,
         default: %{
@@ -174,6 +178,10 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:fuse_warning_tokens, :integer, default: 1_000_000)
+      field(:fuse_no_progress_tokens, :integer, default: 2_000_000)
+      field(:fuse_no_progress_ms, :integer, default: 600_000)
+      field(:fuse_hard_tokens, :integer, default: 4_000_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -183,12 +191,20 @@ defmodule SymphonyElixir.Config.Schema do
         attrs,
         [
           :command,
+          :executable,
+          :args,
+          :env,
+          :path_entries,
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :fuse_warning_tokens,
+          :fuse_no_progress_tokens,
+          :fuse_no_progress_ms,
+          :fuse_hard_tokens
         ],
         empty_values: []
       )
@@ -196,6 +212,10 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:fuse_warning_tokens, greater_than_or_equal_to: 0)
+      |> validate_number(:fuse_no_progress_tokens, greater_than_or_equal_to: 0)
+      |> validate_number(:fuse_no_progress_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:fuse_hard_tokens, greater_than: 0)
     end
   end
 
@@ -380,6 +400,9 @@ defmodule SymphonyElixir.Config.Schema do
     codex = %{
       settings.codex
       | approval_policy: normalize_keys(settings.codex.approval_policy),
+        executable: resolve_optional_path_value(settings.codex.executable),
+        path_entries: normalize_optional_path_list(settings.codex.path_entries),
+        env: normalize_optional_map(settings.codex.env) || %{},
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
@@ -434,6 +457,23 @@ defmodule SymphonyElixir.Config.Schema do
         path
     end
   end
+
+  defp resolve_optional_path_value(nil), do: nil
+  defp resolve_optional_path_value(""), do: nil
+
+  defp resolve_optional_path_value(value) when is_binary(value) do
+    resolve_path_value(value, nil)
+  end
+
+  defp resolve_optional_path_value(_value), do: nil
+
+  defp normalize_optional_path_list(values) when is_list(values) do
+    values
+    |> Enum.map(&resolve_optional_path_value/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp normalize_optional_path_list(_values), do: []
 
   defp resolve_env_value(value, fallback) when is_binary(value) do
     case env_reference_name(value) do

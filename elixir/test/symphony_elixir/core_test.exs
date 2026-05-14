@@ -17,6 +17,10 @@ defmodule SymphonyElixir.CoreTest do
     assert config.tracker.terminal_states == ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
     assert config.tracker.assignee == nil
     assert config.agent.max_turns == 20
+    assert config.codex.fuse_warning_tokens == 1_000_000
+    assert config.codex.fuse_no_progress_tokens == 2_000_000
+    assert config.codex.fuse_no_progress_ms == 600_000
+    assert config.codex.fuse_hard_tokens == 4_000_000
 
     write_workflow_file!(Workflow.workflow_file_path(), poll_interval_ms: "invalid")
 
@@ -86,6 +90,14 @@ defmodule SymphonyElixir.CoreTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "123")
     assert {:error, {:unsupported_tracker_kind, "123"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_fuse_hard_tokens: -1)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.fuse_hard_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_fuse_hard_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.fuse_hard_tokens"
   end
 
   test "current WORKFLOW.md file is valid and complete" do
@@ -2101,6 +2113,214 @@ defmodule SymphonyElixir.CoreTest do
                  false
                end
              end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "codex token notifications do not reset durable progress" do
+    started_at = DateTime.add(DateTime.utc_now(), -120, :second)
+    event_at = DateTime.utc_now()
+
+    running_entry = %{
+      session_id: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      last_durable_progress_at: started_at,
+      last_durable_progress_tokens: 0
+    }
+
+    {updated, _delta} =
+      Orchestrator.integrate_codex_update_for_test(running_entry, %{
+        event: :notification,
+        timestamp: event_at,
+        payload: %{
+          "tokenUsage" => %{
+            "total" => %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125}
+          }
+        }
+      })
+
+    assert updated.codex_total_tokens == 125
+    assert updated.last_codex_timestamp == event_at
+    assert updated.last_durable_progress_at == started_at
+    assert updated.last_durable_progress_tokens == 0
+  end
+
+  test "terminal codex events reset durable progress" do
+    started_at = DateTime.add(DateTime.utc_now(), -120, :second)
+    event_at = DateTime.utc_now()
+
+    running_entry = %{
+      session_id: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      last_durable_progress_at: started_at,
+      last_durable_progress_tokens: 0
+    }
+
+    {updated, _delta} =
+      Orchestrator.integrate_codex_update_for_test(running_entry, %{
+        event: :turn_completed,
+        timestamp: event_at,
+        payload: %{
+          "method" => "turn/completed",
+          "usage" => %{"input_tokens" => 100, "output_tokens" => 25, "total_tokens" => 125}
+        }
+      })
+
+    assert updated.last_durable_progress_at == event_at
+    assert updated.last_durable_progress_tokens == 125
+    assert updated.last_durable_progress_source == :turn_completed
+  end
+
+  test "hard token fuse terminates a running issue without scheduling retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_fuse_hard_tokens: 100,
+      codex_fuse_no_progress_tokens: 0,
+      codex_fuse_no_progress_ms: 0
+    )
+
+    now = DateTime.utc_now()
+    issue = %Issue{id: "issue-fuse", identifier: "DTS-FUSE", state: "Symphony Ready"}
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-fuse" => %{
+          pid: nil,
+          ref: nil,
+          identifier: "DTS-FUSE",
+          issue: issue,
+          started_at: DateTime.add(now, -60, :second),
+          last_durable_progress_at: DateTime.add(now, -60, :second),
+          last_durable_progress_tokens: 0,
+          codex_total_tokens: 125,
+          codex_input_tokens: 120,
+          codex_output_tokens: 5,
+          turn_count: 1,
+          session_id: "session-fuse",
+          workspace_path: nil
+        }
+      },
+      claimed: MapSet.new(["issue-fuse"]),
+      completed: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated = Orchestrator.reconcile_runaway_running_issues_for_test(state, now)
+
+    refute Map.has_key?(updated.running, "issue-fuse")
+    refute Map.has_key?(updated.retry_attempts, "issue-fuse")
+    assert updated.completed["issue-fuse"].state == "NEEDS HUMAN"
+    assert updated.completed["issue-fuse"].phase == "runaway token/progress fuse"
+    assert updated.completed["issue-fuse"].blocker_fingerprint =~ ~r/^[a-f0-9]{64}$/
+  end
+
+  test "streaming notifications do not satisfy the no-progress token fuse" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_fuse_hard_tokens: 1_000_000,
+      codex_fuse_no_progress_tokens: 200,
+      codex_fuse_no_progress_ms: 0
+    )
+
+    now = DateTime.utc_now()
+    issue = %Issue{id: "issue-streaming-fuse", identifier: "DTS-STREAM", state: "Symphony Ready"}
+
+    state = %Orchestrator.State{
+      running: %{
+        "issue-streaming-fuse" => %{
+          pid: nil,
+          ref: nil,
+          identifier: "DTS-STREAM",
+          issue: issue,
+          started_at: DateTime.add(now, -60, :second),
+          last_codex_timestamp: now,
+          last_codex_event: :notification,
+          last_durable_progress_at: DateTime.add(now, -60, :second),
+          last_durable_progress_tokens: 0,
+          codex_total_tokens: 250,
+          codex_input_tokens: 240,
+          codex_output_tokens: 10,
+          turn_count: 1,
+          session_id: "session-stream",
+          workspace_path: nil
+        }
+      },
+      claimed: MapSet.new(["issue-streaming-fuse"]),
+      completed: %{},
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+    }
+
+    updated = Orchestrator.reconcile_runaway_running_issues_for_test(state, now)
+
+    refute Map.has_key?(updated.running, "issue-streaming-fuse")
+    assert updated.completed["issue-streaming-fuse"].state == "NEEDS HUMAN"
+    assert updated.completed["issue-streaming-fuse"].error =~ "No durable progress"
+  end
+
+  test "material workspace evidence changes reset durable progress before the time fuse" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_fuse_hard_tokens: 1_000_000,
+      codex_fuse_no_progress_tokens: 0,
+      codex_fuse_no_progress_ms: 1
+    )
+
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-durable-progress-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      File.mkdir_p!(test_root)
+      File.write!(Path.join(test_root, "REVIEW.md"), "fresh evidence")
+
+      now = DateTime.utc_now()
+      issue = %Issue{id: "issue-evidence-progress", identifier: "DTS-EVIDENCE", state: "Symphony Ready"}
+
+      state = %Orchestrator.State{
+        running: %{
+          "issue-evidence-progress" => %{
+            pid: nil,
+            ref: nil,
+            identifier: "DTS-EVIDENCE",
+            issue: issue,
+            started_at: DateTime.add(now, -60, :second),
+            last_durable_progress_at: DateTime.add(now, -60, :second),
+            last_durable_progress_tokens: 0,
+            durable_workspace_signature: "old-signature",
+            codex_total_tokens: 50,
+            codex_input_tokens: 40,
+            codex_output_tokens: 10,
+            turn_count: 1,
+            session_id: "session-evidence",
+            workspace_path: test_root
+          }
+        },
+        claimed: MapSet.new(["issue-evidence-progress"]),
+        completed: %{},
+        retry_attempts: %{},
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0}
+      }
+
+      updated = Orchestrator.reconcile_runaway_running_issues_for_test(state, now)
+
+      assert Map.has_key?(updated.running, "issue-evidence-progress")
+      refute Map.has_key?(updated.completed, "issue-evidence-progress")
+      assert updated.running["issue-evidence-progress"].last_durable_progress_at == now
+      assert updated.running["issue-evidence-progress"].last_durable_progress_source == :workspace_evidence
     after
       File.rm_rf(test_root)
     end
