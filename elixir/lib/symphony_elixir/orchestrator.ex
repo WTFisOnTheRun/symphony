@@ -1692,6 +1692,15 @@ defmodule SymphonyElixir.Orchestrator do
             true
         end
 
+      %{} = ledger ->
+        if ended_ledger_with_unresolved_blocker?(ledger) do
+          Logger.info("Skipping dispatch for #{issue_context(issue)}; observability ledger has ended_at and an unresolved blocker")
+
+          true
+        else
+          false
+        end
+
       _ledger ->
         false
     end
@@ -1716,6 +1725,41 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp read_observability_ledger(_issue), do: nil
+
+  defp ended_ledger_with_unresolved_blocker?(ledger) when is_map(ledger) do
+    ledger_value_present?(Map.get(ledger, "ended_at")) and unresolved_blocker?(ledger)
+  end
+
+  defp ended_ledger_with_unresolved_blocker?(_ledger), do: false
+
+  defp unresolved_blocker?(ledger) when is_map(ledger) do
+    fingerprint = normalized_ledger_value(Map.get(ledger, "blocker_fingerprint"))
+
+    cond do
+      fingerprint != "" ->
+        not resolved_blocker_fingerprint?(ledger, fingerprint)
+
+      ledger_value_present?(Map.get(ledger, "blocker_reason")) ->
+        true
+
+      true ->
+        false
+    end
+  end
+
+  defp resolved_blocker_fingerprint?(ledger, fingerprint) when is_map(ledger) and is_binary(fingerprint) do
+    ledger
+    |> Map.get("resolved_blocker_fingerprints", [])
+    |> List.wrap()
+    |> Enum.map(&normalized_ledger_value/1)
+    |> Enum.any?(&(&1 == fingerprint))
+  end
+
+  defp ledger_value_present?(value), do: normalized_ledger_value(value) != ""
+
+  defp normalized_ledger_value(value) when is_binary(value), do: String.trim(value)
+  defp normalized_ledger_value(value) when is_atom(value), do: value |> Atom.to_string() |> String.trim()
+  defp normalized_ledger_value(_value), do: ""
 
   defp dts_logs_root do
     # TODO: add a first-class Config field for the observability logs root.

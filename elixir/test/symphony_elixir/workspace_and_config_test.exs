@@ -725,6 +725,21 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
   end
 
+  test "ended queued observability ledger with unresolved blocker is not dispatch-eligible" do
+    with_observability_ledger("MT-1015", %{
+      state: "QUEUED",
+      phase: "queued",
+      ended_at: "2026-05-15T16:38:16Z",
+      blocker_reason: "Issue absent from dashboard running/retrying after stale-ready threshold.",
+      blocker_fingerprint: "stale-ready-watchdog",
+      resolved_blocker_fingerprints: []
+    })
+
+    issue = issue_with_description("MT-1015", "Ready issue after an interrupted stale-ready run.")
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+  end
+
   test "issue assigned to another worker is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "dev@example.com")
 

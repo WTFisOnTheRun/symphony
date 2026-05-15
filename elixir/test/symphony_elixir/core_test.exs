@@ -703,6 +703,84 @@ defmodule SymphonyElixir.CoreTest do
     refute MapSet.member?(state.claimed, issue_id)
   end
 
+  test "active retry honors ended observability ledger blocker guard" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo"],
+      max_concurrent_agents: 1
+    )
+
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-ended-ledger-retry-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      restore_app_env(:log_file, previous_log_file)
+      File.rm_rf(logs_root)
+    end)
+
+    issue_id = "issue-ended-ledger-retry"
+    retry_token = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :EndedLedgerRetryOrchestrator)
+
+    File.write!(
+      Path.join(ledger_root, "MT-563.json"),
+      Jason.encode!(%{
+        state: "QUEUED",
+        phase: "queued",
+        ended_at: "2026-05-15T16:38:16Z",
+        blocker_reason: "Issue absent from dashboard running/retrying after stale-ready threshold.",
+        blocker_fingerprint: "stale-ready-watchdog",
+        resolved_blocker_fingerprints: []
+      })
+    )
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-563",
+      state: "Todo",
+      title: "Ended queued retry",
+      comments: [%{body: "## Symphony Blocked - stale-ready watchdog", created_at: ~U[2026-05-15 16:38:16Z]}]
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    :sys.replace_state(pid, fn _ ->
+      %{
+        initial_state
+        | running: %{},
+          claimed: MapSet.new(),
+          retry_attempts: %{
+            issue_id => %{
+              attempt: 1,
+              retry_token: retry_token,
+              identifier: "MT-563"
+            }
+          }
+      }
+    end)
+
+    send(pid, {:retry_issue, issue_id, retry_token})
+    Process.sleep(50)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.claimed, issue_id)
+  end
+
   test "active retry continues when needs-human ledger was resolved by a Goal Contract description update" do
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "memory",
