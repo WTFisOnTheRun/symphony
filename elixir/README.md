@@ -78,7 +78,7 @@ If no path is passed, Symphony defaults to `./WORKFLOW.md`.
 Optional flags:
 
 - `--logs-root` tells Symphony to write logs under a different directory (default: `./log`)
-- `--port` also starts the Phoenix observability service (default: disabled)
+- `--port` also starts the Phoenix observability service (default: disabled). When enabled, `http://127.0.0.1:<port>/` serves the operator cockpit: an **Elvis Review Queue** that pins blocked and in-review tasks to the top of the page, per-task milestone progress, blocker fingerprint + remediation hint, evidence path, and a primary CTA that copies the review path to the clipboard. `http://127.0.0.1:<port>/api/v1/state` remains as the raw JSON debug surface.
 
 The `WORKFLOW.md` file uses YAML front matter for configuration, plus a Markdown body used as the
 Codex session prompt.

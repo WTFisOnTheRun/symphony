@@ -84,6 +84,77 @@ defmodule SymphonyElixirWeb.DashboardLive do
         </section>
       <% end %>
 
+      <section
+        class={review_queue_class(@payload.review_queue)}
+        aria-label="Elvis review queue"
+      >
+        <div class="section-header">
+          <div>
+            <h2 class="section-title">Elvis Review Queue</h2>
+            <p class="section-copy">
+              Items waiting on your attention. Blocked tasks first, then in-review tasks; oldest within each category.
+            </p>
+          </div>
+          <span class={review_queue_pill_class(@payload.review_queue)}>
+            <%= review_queue_pill_label(@payload.review_queue) %>
+          </span>
+        </div>
+
+        <%= if @payload.review_queue == [] do %>
+          <p class="review-queue-empty">
+            <span class="review-queue-empty-eyebrow">Inbox zero.</span>
+            Nothing needs your attention right now. Symphony will surface blocked or in-review items here as they appear.
+          </p>
+        <% else %>
+          <div class="review-queue-list">
+            <article
+              :for={task <- @payload.review_queue}
+              class={"review-queue-row review-queue-row-#{task.category}"}
+            >
+              <div class="review-queue-row-head">
+                <a class="issue-id" href={task.linear_url} target="_blank" rel="noopener">
+                  <%= task.issue_identifier %>
+                </a>
+                <span class={state_badge_class(task.state)}><%= task.state %></span>
+                <span class="review-queue-time numeric">
+                  last event <%= format_timestamp(task.last_event_at) %>
+                </span>
+              </div>
+
+              <div class="review-queue-row-body">
+                <%= if task.category == "blocked" do %>
+                  <p class="review-queue-blocker">
+                    <span class="row-label">Blocker</span>
+                    <span><%= task.blocker_reason || "Reason not recorded" %></span>
+                  </p>
+                  <p :if={task.blocker_fingerprint} class="review-queue-fingerprint mono">
+                    <span class="row-label">Fingerprint</span>
+                    <span><%= task.blocker_fingerprint %></span>
+                  </p>
+                  <p :if={task.blocker_hint} class="blocker-hint">
+                    <span class="row-label">How to clear</span>
+                    <span><%= task.blocker_hint %></span>
+                  </p>
+                <% else %>
+                  <p class="review-queue-summary">
+                    <span class="row-label">Current phase</span>
+                    <span><%= task.current_phase || "Ready for review" %></span>
+                  </p>
+                <% end %>
+                <p class="review-queue-action">
+                  <span class="row-label">Next action</span>
+                  <span><%= task.next_human_action %></span>
+                </p>
+              </div>
+
+              <div class="review-queue-row-cta">
+                <.cta_button task={task} variant="queue" />
+              </div>
+            </article>
+          </div>
+        <% end %>
+      </section>
+
       <section class="metric-grid">
         <article class="metric-card">
           <p class="metric-label">Running</p>
@@ -175,7 +246,15 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <dt>Blocker fingerprint</dt>
                       <dd class="mono"><%= task.blocker_fingerprint %></dd>
                     </div>
+                    <div :if={task.blocker_hint}>
+                      <dt>How to clear</dt>
+                      <dd><%= task.blocker_hint %></dd>
+                    </div>
                   </dl>
+
+                  <div :if={task_cta_visible?(task)} class="task-cta-row">
+                    <.cta_button task={task} variant="card" />
+                  </div>
 
                   <div class="path-list">
                     <.path_row label="Workspace" path={task.workspace_path} />
@@ -186,7 +265,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
                 </div>
 
                 <div class="milestone-panel">
-                  <h3 class="subsection-title">Milestones</h3>
+                  <h3 class="subsection-title">
+                    Milestones
+                    <span class="milestone-summary numeric">
+                      <%= task.milestone_summary.passed %> / <%= task.milestone_summary.total %> passed
+                    </span>
+                  </h3>
                   <ol class="milestone-list">
                     <li :for={milestone <- task.milestones} class={milestone_class(milestone.state)}>
                       <span class="milestone-dot" aria-hidden="true"></span>
@@ -258,6 +342,73 @@ defmodule SymphonyElixirWeb.DashboardLive do
         Copy
       </button>
     </div>
+    """
+  end
+
+  attr(:task, :map, required: true)
+  attr(:variant, :string, default: "card")
+
+  defp cta_button(%{task: %{action_kind: :open_review, review_path: review_path}} = assigns)
+       when is_binary(review_path) and review_path != "" do
+    ~H"""
+    <button
+      type="button"
+      class={"cta-primary cta-#{@variant}"}
+      data-label="Copy REVIEW.md path"
+      data-copy={@task.review_path}
+      onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied REVIEW.md path'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1500);"
+    >
+      Copy REVIEW.md path
+    </button>
+    """
+  end
+
+  defp cta_button(%{task: %{action_kind: :open_evidence, evidence_paths: paths}} = assigns)
+       when is_list(paths) and paths != [] do
+    assigns = assign(assigns, :first_evidence, List.first(paths))
+
+    ~H"""
+    <button
+      type="button"
+      class={"cta-primary cta-#{@variant}"}
+      data-label="Copy evidence path"
+      data-copy={@first_evidence}
+      onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied evidence path'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1500);"
+    >
+      Copy evidence path
+    </button>
+    """
+  end
+
+  defp cta_button(%{task: %{action_kind: :repair_runtime}} = assigns) do
+    ~H"""
+    <span class={"cta-locked cta-#{@variant}"}>
+      <span class="cta-locked-dot" aria-hidden="true"></span> Resolve runtime preflight
+    </span>
+    """
+  end
+
+  defp cta_button(%{task: %{action_kind: :repair_write_scope}} = assigns) do
+    ~H"""
+    <span class={"cta-locked cta-#{@variant}"}>
+      <span class="cta-locked-dot" aria-hidden="true"></span> Resolve write-scope
+    </span>
+    """
+  end
+
+  defp cta_button(%{task: %{action_kind: :rerelease}} = assigns) do
+    ~H"""
+    <span class={"cta-locked cta-#{@variant}"}>
+      <span class="cta-locked-dot" aria-hidden="true"></span> Re-release after fix
+    </span>
+    """
+  end
+
+  defp cta_button(assigns) do
+    ~H"""
+    <a class={"cta-link cta-#{@variant}"} href={@task.linear_url} target="_blank" rel="noopener">
+      Open Linear issue
+    </a>
     """
   end
 
@@ -334,4 +485,25 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp short_id(id), do: id || "n/a"
+
+  defp review_queue_class([]), do: "section-panel review-queue review-queue-empty-state"
+  defp review_queue_class(_queue), do: "section-panel review-queue review-queue-active"
+
+  defp review_queue_pill_class([]), do: "pill review-queue-pill review-queue-pill-empty"
+  defp review_queue_pill_class(_queue), do: "pill review-queue-pill review-queue-pill-attention"
+
+  defp review_queue_pill_label([]), do: "Inbox zero"
+
+  defp review_queue_pill_label(queue) do
+    case length(queue) do
+      1 -> "1 needs you"
+      n -> "#{n} need you"
+    end
+  end
+
+  defp task_cta_visible?(%{action_kind: kind})
+       when kind in [:open_review, :open_evidence, :repair_runtime, :repair_write_scope, :rerelease],
+       do: true
+
+  defp task_cta_visible?(_task), do: false
 end

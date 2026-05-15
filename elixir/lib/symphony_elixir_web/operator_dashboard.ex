@@ -39,14 +39,16 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
     api_payload = Presenter.state_payload(orchestrator, snapshot_timeout_ms)
     runtime_state = read_json(Path.join(logs_root, "runtime-state.json"))
     ledgers = read_ledgers(logs_root, runtime_state, Keyword.get(opts, :fixture_ledger_root))
-    tasks = build_tasks(api_payload, runtime_state, ledgers)
+    all_tasks = build_tasks(api_payload, runtime_state, ledgers)
+    visible_tasks = Enum.take(all_tasks, @max_tasks)
 
     %{
       generated_at: generated_at,
       api: api_summary(api_payload),
       runtime: runtime_summary(runtime_state, logs_root, length(ledgers)),
-      counts: counts(api_payload, runtime_state, tasks),
-      tasks: tasks,
+      counts: counts(api_payload, runtime_state, all_tasks),
+      tasks: visible_tasks,
+      review_queue: review_queue(all_tasks),
       warnings: warnings(api_payload, runtime_state, generated_at),
       refresh: %{
         mode: "LiveView events plus file polling fallback",
@@ -61,6 +63,22 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       }
     }
   end
+
+  defp review_queue(tasks) do
+    tasks
+    |> Enum.filter(&(&1.category in ["blocked", "in-review"]))
+    |> Enum.sort_by(fn task ->
+      {
+        review_queue_rank(task.category),
+        timestamp_sort_value(task.last_event_at || task.ended_at || task.started_at),
+        task.issue_identifier
+      }
+    end)
+  end
+
+  defp review_queue_rank("blocked"), do: 0
+  defp review_queue_rank("in-review"), do: 1
+  defp review_queue_rank(_category), do: 2
 
   defp api_summary(%{error: %{code: code, message: message}, generated_at: generated_at}) do
     %{
@@ -186,8 +204,13 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       )
     end)
     |> Enum.reject(&is_nil/1)
-    |> Enum.sort_by(fn task -> {category_rank(task.category), -timestamp_sort_value(task.last_event_at || task.ended_at || task.started_at)} end)
-    |> Enum.take(@max_tasks)
+    |> Enum.sort_by(fn task ->
+      {
+        category_rank(task.category),
+        -timestamp_sort_value(task.last_event_at || task.ended_at || task.started_at),
+        task.issue_identifier
+      }
+    end)
   end
 
   defp api_entries(%{error: _error}), do: %{}
@@ -285,7 +308,9 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
     evidence_paths = safe_paths(value(ledger, "evidence_paths"))
     review_path = latest_output_path || review_path_from_workspace(workspace_path)
     blocker_reason = safe_text(value(ledger, "blocker_reason") || value(ledger, "latest_error") || value(runtime_entry, "latest_error"))
+    blocker_fingerprint = safe_text(value(ledger, "blocker_fingerprint"))
     category = task_category(state, api_entry, runtime_entry, blocker_reason, review_path, evidence_paths)
+    milestones_built = milestones(value(ledger, "milestones"))
 
     %{
       issue_identifier: identifier,
@@ -303,12 +328,15 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       review_path: review_path,
       evidence_paths: evidence_paths,
       blocker_reason: blocker_reason,
-      blocker_fingerprint: safe_text(value(ledger, "blocker_fingerprint")),
+      blocker_fingerprint: blocker_fingerprint,
+      blocker_hint: blocker_hint(blocker_fingerprint),
       next_human_action: next_human_action(ledger, category),
+      action_kind: next_action_kind(category, blocker_fingerprint, review_path, evidence_paths),
       session_id: safe_text(first_present([value(ledger, "session_id"), value(api_entry, :session_id), value(runtime_entry, "session_id")])),
       turn_count: first_present([value(ledger, "turn_count"), value(api_entry, :turn_count), value(runtime_entry, "turn_count")]),
       tokens: tokens(ledger, api_entry, runtime_entry),
-      milestones: milestones(value(ledger, "milestones")),
+      milestones: milestones_built,
+      milestone_summary: milestone_summary(milestones_built),
       history: history(value(ledger, "history")),
       sources: task_sources(api_entry, runtime_entry, ledger)
     }
@@ -411,6 +439,55 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
   defp default_next_human_action("active"), do: "Monitor heartbeat and milestone movement."
   defp default_next_human_action("retrying"), do: "Watch retry result; intervene only if the blocker repeats."
   defp default_next_human_action(_category), do: "No next action recorded."
+
+  defp next_action_kind(category, blocker_fingerprint, review_path, evidence_paths) do
+    cond do
+      runtime_fingerprint?(blocker_fingerprint) -> :repair_runtime
+      write_scope_fingerprint?(blocker_fingerprint) -> :repair_write_scope
+      category == "blocked" -> :rerelease
+      category == "in-review" and present?(review_path) -> :open_review
+      category == "in-review" and evidence_paths != [] -> :open_evidence
+      true -> :monitor
+    end
+  end
+
+  defp blocker_hint(blocker_fingerprint) when is_binary(blocker_fingerprint) do
+    cond do
+      runtime_fingerprint?(blocker_fingerprint) ->
+        "Run preflight (`where.exe mise`, `mise exec -- mix --version`, `Test-Path erlexec.dll`) and write RUNTIME_PREFLIGHT_EVIDENCE.md with PASS markers under the run folder."
+
+      write_scope_fingerprint?(blocker_fingerprint) ->
+        "Revert the unauthorized writes in `symphony\\elixir` OR update the Goal Contract to explicitly name those paths, then re-release."
+
+      String.contains?(blocker_fingerprint, "format") ->
+        "Format only the in-scope files, OR add a Validation Scope Amendment to the Goal Contract that narrows the format gate to authorized paths."
+
+      true ->
+        nil
+    end
+  end
+
+  defp blocker_hint(_blocker_fingerprint), do: nil
+
+  defp runtime_fingerprint?(fingerprint) when is_binary(fingerprint) do
+    String.starts_with?(fingerprint, "runtime_verification_unavailable")
+  end
+
+  defp runtime_fingerprint?(_fingerprint), do: false
+
+  defp write_scope_fingerprint?(fingerprint) when is_binary(fingerprint) do
+    String.contains?(fingerprint, "write_scope") or String.contains?(fingerprint, "unauthorized")
+  end
+
+  defp write_scope_fingerprint?(_fingerprint), do: false
+
+  defp milestone_summary(milestones) when is_list(milestones) do
+    total = length(milestones)
+    passed = Enum.count(milestones, &(&1.state == "passed"))
+    %{passed: passed, total: total}
+  end
+
+  defp milestone_summary(_milestones), do: %{passed: 0, total: 0}
 
   defp read_ledgers(logs_root, runtime_state, fixture_ledger_root) do
     logs_root

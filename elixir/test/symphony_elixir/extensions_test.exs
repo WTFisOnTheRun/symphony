@@ -483,7 +483,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
-        snapshot: static_snapshot(),
+        snapshot: empty_static_snapshot(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -605,7 +605,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
-        snapshot: static_snapshot(),
+        snapshot: empty_static_snapshot(),
         refresh: %{
           queued: true,
           coalesced: false,
@@ -677,6 +677,281 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _view, html} = live(build_conn(), "/")
     assert html =~ "Snapshot unavailable"
     assert html =~ "snapshot_unavailable"
+  end
+
+  test "review queue surfaces blocked tasks before in-review tasks" do
+    logs_root = dashboard_logs_root()
+    write_dashboard_ledger_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueSortOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Elvis Review Queue"
+    assert html =~ "review-queue-row-blocked"
+    assert html =~ "review-queue-row-in-review"
+    refute html =~ "Inbox zero."
+
+    {block_idx, _} = :binary.match(html, "review-queue-row-blocked")
+    {in_review_idx, _} = :binary.match(html, "review-queue-row-in-review")
+    assert block_idx < in_review_idx
+
+    {queue_start, _} = :binary.match(html, "Elvis Review Queue")
+    {task_progress_start, _} = :binary.match(html, "Task Progress")
+    assert queue_start < task_progress_start
+  end
+
+  test "review queue keeps attention items even when task progress is capped" do
+    logs_root = dashboard_logs_root()
+    write_review_queue_overflow_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueOverflowOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    payload = SymphonyElixirWeb.OperatorDashboard.payload(orchestrator_name, 50, dts_logs_root: logs_root)
+
+    assert length(payload.tasks) == 18
+    assert payload.counts.blocked == 1
+    assert payload.counts.in_review == 1
+    assert Enum.map(payload.review_queue, & &1.issue_identifier) == ["MT-BLOCK-CAPPED", "MT-REVIEW-CAPPED"]
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    queue_html = html_before_task_progress(html)
+
+    assert queue_html =~ "MT-BLOCK-CAPPED"
+    assert queue_html =~ "MT-REVIEW-CAPPED"
+    assert queue_html =~ "2 need you"
+  end
+
+  test "review queue sorts oldest-first within blocked and in-review categories" do
+    logs_root = dashboard_logs_root()
+    write_review_queue_order_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueOldestFirstOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: empty_static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+    queue_html = html_before_task_progress(html)
+
+    assert_html_order(queue_html, [
+      "MT-BLOCK-OLD",
+      "MT-BLOCK-NEW",
+      "MT-REVIEW-OLD",
+      "MT-REVIEW-NEW"
+    ])
+  end
+
+  test "review queue renders inbox zero green empty state when nothing needs the operator" do
+    logs_root = dashboard_logs_root()
+    write_review_queue_empty_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueEmptyOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Elvis Review Queue"
+    assert html =~ "Inbox zero."
+    assert html =~ "review-queue-empty-state"
+    assert html =~ "review-queue-pill-empty"
+    refute html =~ "review-queue-row-blocked"
+    refute html =~ "review-queue-row-in-review"
+  end
+
+  test "review queue exposes copy REVIEW.md CTA when a review path is present" do
+    logs_root = dashboard_logs_root()
+    write_dashboard_ledger_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueCtaOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "Copy REVIEW.md path"
+    assert html =~ "C:/tmp/MT-DONE/REVIEW.md"
+    assert html =~ "cta-primary"
+  end
+
+  test "review queue falls back to copy-evidence CTA when only evidence paths exist" do
+    logs_root = dashboard_logs_root()
+    write_review_queue_evidence_only_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueEvidenceOnlyOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "MT-EVIDENCE"
+    assert html =~ "Copy evidence path"
+    assert html =~ "C:/tmp/MT-EVIDENCE/EVIDENCE.md"
+    refute html =~ "Copy REVIEW.md path"
+  end
+
+  test "review queue surfaces runtime preflight remediation hint and locked CTA" do
+    logs_root = dashboard_logs_root()
+    write_review_queue_runtime_blocker_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :ReviewQueueRuntimeBlockerOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "MT-RUNTIME"
+    assert html =~ "runtime_verification_unavailable_mise_missing"
+    assert html =~ "Run preflight"
+    assert html =~ "RUNTIME_PREFLIGHT_EVIDENCE.md"
+    assert html =~ "Resolve runtime preflight"
+    assert html =~ "cta-locked"
+  end
+
+  test "task cards surface milestone progress summary" do
+    logs_root = dashboard_logs_root()
+    write_dashboard_ledger_fixture(logs_root)
+
+    orchestrator_name = Module.concat(__MODULE__, :MilestoneSummaryOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(
+      orchestrator: orchestrator_name,
+      snapshot_timeout_ms: 50,
+      dts_logs_root: logs_root
+    )
+
+    {:ok, _view, html} = live(build_conn(), "/")
+
+    assert html =~ "milestone-summary"
+    assert html =~ "10 / 10 passed"
   end
 
   test "http server serves embedded assets, accepts form posts, and rejects invalid hosts" do
@@ -840,6 +1115,168 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
   end
 
+  defp write_review_queue_overflow_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    active_ids =
+      Enum.map(1..19, fn index ->
+        "MT-ACTIVE-#{String.pad_leading(Integer.to_string(index), 2, "0")}"
+      end)
+
+    running_entries =
+      Enum.map(active_ids, fn identifier ->
+        %{
+          issue_identifier: identifier,
+          issue_id: "#{identifier}-id",
+          state: "In Progress",
+          started_at: "2026-05-14T09:00:00Z",
+          last_event_at: active_last_event_at(identifier),
+          last_message: "fixture active heartbeat",
+          workspace_path: "C:/tmp/#{identifier}"
+        }
+      end)
+
+    all_ledger_ids = active_ids ++ ["MT-BLOCK-CAPPED", "MT-REVIEW-CAPPED"]
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: running_entries,
+      retrying: [],
+      stale_ready: [],
+      terminal: ["MT-BLOCK-CAPPED", "MT-REVIEW-CAPPED"],
+      ledgers: Enum.map(all_ledger_ids, &Path.join(ledger_root, "#{&1}.json")),
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    Enum.each(active_ids, fn identifier ->
+      write_ledger(
+        ledger_root,
+        identifier,
+        %{
+          "state" => "RUNNING",
+          "phase" => "streaming turn",
+          "workspace" => "C:/tmp/#{identifier}",
+          "last_event_at" => active_last_event_at(identifier),
+          "last_message" => "fixture active heartbeat",
+          "milestones" => fixture_milestones("running")
+        }
+      )
+    end)
+
+    write_ledger(
+      ledger_root,
+      "MT-BLOCK-CAPPED",
+      %{
+        "state" => "BLOCKED",
+        "phase" => "blocked after active cap",
+        "workspace" => "C:/tmp/MT-BLOCK-CAPPED",
+        "blocker_reason" => "Must still surface even when active tasks fill the task list.",
+        "blocker_fingerprint" => "fixture_blocker_after_cap",
+        "next_human_action" => "Resolve capped blocker.",
+        "last_event_at" => "2026-05-14T08:00:00Z",
+        "milestones" => fixture_milestones("blocked")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-REVIEW-CAPPED",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "review after active cap",
+        "workspace" => "C:/tmp/MT-REVIEW-CAPPED",
+        "latest_output_path" => "C:/tmp/MT-REVIEW-CAPPED/REVIEW.md",
+        "evidence_paths" => ["C:/tmp/MT-REVIEW-CAPPED/REVIEW.md"],
+        "next_human_action" => "Review capped evidence.",
+        "last_event_at" => "2026-05-14T08:05:00Z",
+        "milestones" => fixture_milestones("passed")
+      }
+    )
+  end
+
+  defp write_review_queue_order_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    ledger_ids = ["MT-BLOCK-OLD", "MT-BLOCK-NEW", "MT-REVIEW-OLD", "MT-REVIEW-NEW"]
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [],
+      retrying: [],
+      stale_ready: [],
+      terminal: ledger_ids,
+      ledgers: Enum.map(ledger_ids, &Path.join(ledger_root, "#{&1}.json")),
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    write_ledger(
+      ledger_root,
+      "MT-BLOCK-OLD",
+      %{
+        "state" => "BLOCKED",
+        "phase" => "older blocked",
+        "workspace" => "C:/tmp/MT-BLOCK-OLD",
+        "blocker_reason" => "Older blocked fixture.",
+        "last_event_at" => "2026-05-14T08:00:00Z",
+        "milestones" => fixture_milestones("blocked")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-BLOCK-NEW",
+      %{
+        "state" => "BLOCKED",
+        "phase" => "newer blocked",
+        "workspace" => "C:/tmp/MT-BLOCK-NEW",
+        "blocker_reason" => "Newer blocked fixture.",
+        "last_event_at" => "2026-05-14T08:30:00Z",
+        "milestones" => fixture_milestones("blocked")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-REVIEW-OLD",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "older review",
+        "workspace" => "C:/tmp/MT-REVIEW-OLD",
+        "latest_output_path" => "C:/tmp/MT-REVIEW-OLD/REVIEW.md",
+        "last_event_at" => "2026-05-14T09:00:00Z",
+        "milestones" => fixture_milestones("passed")
+      }
+    )
+
+    write_ledger(
+      ledger_root,
+      "MT-REVIEW-NEW",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "newer review",
+        "workspace" => "C:/tmp/MT-REVIEW-NEW",
+        "latest_output_path" => "C:/tmp/MT-REVIEW-NEW/REVIEW.md",
+        "last_event_at" => "2026-05-14T09:30:00Z",
+        "milestones" => fixture_milestones("passed")
+      }
+    )
+  end
+
+  defp active_last_event_at(identifier) do
+    <<_prefix::binary-size(10), index::binary>> = identifier
+    "2026-05-14T10:#{index}:00Z"
+  end
+
   defp write_bom_dashboard_ledger_fixture(logs_root) do
     ledger_root = Path.join(logs_root, "ledger")
     File.mkdir_p!(ledger_root)
@@ -880,6 +1317,116 @@ defmodule SymphonyElixir.ExtensionsTest do
     File.write!(path, <<0xEF, 0xBB, 0xBF>> <> Jason.encode!(payload, pretty: true))
   end
 
+  defp write_review_queue_empty_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [
+        %{
+          issue_identifier: "MT-ACTIVE",
+          issue_id: "issue-active",
+          state: "In Progress",
+          started_at: "2026-05-14T10:00:00Z",
+          last_event_at: "2026-05-14T10:05:00Z",
+          last_message: "fixture active heartbeat",
+          workspace_path: "C:/tmp/MT-ACTIVE"
+        }
+      ],
+      retrying: [],
+      stale_ready: [],
+      terminal: [],
+      ledgers: [Path.join(ledger_root, "MT-ACTIVE.json")],
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    write_ledger(
+      ledger_root,
+      "MT-ACTIVE",
+      %{
+        "state" => "RUNNING",
+        "phase" => "streaming turn",
+        "workspace" => "C:/tmp/MT-ACTIVE",
+        "last_event_at" => "2026-05-14T10:05:00Z",
+        "last_message" => "fixture active heartbeat",
+        "milestones" => fixture_milestones("running")
+      }
+    )
+  end
+
+  defp write_review_queue_evidence_only_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [],
+      retrying: [],
+      stale_ready: [],
+      terminal: ["MT-EVIDENCE"],
+      ledgers: [Path.join(ledger_root, "MT-EVIDENCE.json")],
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    write_ledger(
+      ledger_root,
+      "MT-EVIDENCE",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "evidence posted",
+        "workspace" => "C:/tmp/MT-EVIDENCE",
+        "evidence_paths" => ["C:/tmp/MT-EVIDENCE/EVIDENCE.md"],
+        "last_event_at" => "2026-05-14T10:20:00Z",
+        "last_message" => "fixture evidence only",
+        "next_human_action" => "Inspect the listed evidence path.",
+        "milestones" => fixture_milestones("passed")
+      }
+    )
+  end
+
+  defp write_review_queue_runtime_blocker_fixture(logs_root) do
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+
+    runtime_state = %{
+      generated_at: DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
+      mode: "fixture",
+      dashboard_reachable: true,
+      running: [],
+      retrying: [],
+      stale_ready: [],
+      terminal: [],
+      ledgers: [Path.join(ledger_root, "MT-RUNTIME.json")],
+      latest_error: nil
+    }
+
+    File.write!(Path.join(logs_root, "runtime-state.json"), Jason.encode!(runtime_state, pretty: true))
+
+    write_ledger(
+      ledger_root,
+      "MT-RUNTIME",
+      %{
+        "state" => "NEEDS HUMAN",
+        "phase" => "blocked by runner fuse",
+        "workspace" => "C:/tmp/MT-RUNTIME",
+        "blocker_reason" => "Runtime verification unavailable.",
+        "blocker_fingerprint" => "runtime_verification_unavailable_mise_missing_erlexec_artifact_qa_skill_missing",
+        "next_human_action" => "Repair the runtime preflight, then re-release.",
+        "last_event_at" => "2026-05-14T10:25:00Z",
+        "milestones" => fixture_milestones("blocked")
+      }
+    )
+  end
+
   defp write_ledger(ledger_root, identifier, fields) do
     body =
       %{
@@ -914,6 +1461,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     |> Map.new(&{&1, %{"state" => state, "at" => "2026-05-14T10:00:00Z"}})
   end
 
+  defp html_before_task_progress(html) do
+    html
+    |> String.split("Task Progress", parts: 2)
+    |> List.first()
+  end
+
+  defp assert_html_order(html, markers) do
+    positions =
+      Enum.map(markers, fn marker ->
+        {position, _length} = :binary.match(html, marker)
+        position
+      end)
+
+    assert positions == Enum.sort(positions)
+  end
+
   defp static_snapshot do
     %{
       running: [
@@ -945,6 +1508,10 @@ defmodule SymphonyElixir.ExtensionsTest do
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
+  end
+
+  defp empty_static_snapshot do
+    %{static_snapshot() | running: [], retrying: []}
   end
 
   defp wait_for_bound_port do
