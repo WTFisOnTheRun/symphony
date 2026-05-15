@@ -307,8 +307,21 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
     latest_output_path = first_safe_path([value(ledger, "latest_output_path")])
     evidence_paths = safe_paths(value(ledger, "evidence_paths"))
     review_path = latest_output_path || review_path_from_workspace(workspace_path)
-    blocker_reason = safe_text(value(ledger, "blocker_reason") || value(ledger, "latest_error") || value(runtime_entry, "latest_error"))
-    blocker_fingerprint = safe_text(value(ledger, "blocker_fingerprint"))
+
+    blocker_reason =
+      safe_text(
+        first_present([
+          value(ledger, "blocker_reason"),
+          value(api_entry, :blocker_reason),
+          api_blocker_error(api_entry),
+          value(ledger, "latest_error"),
+          value(runtime_entry, "latest_error")
+        ])
+      )
+
+    blocker_fingerprint =
+      safe_text(first_present([value(ledger, "blocker_fingerprint"), value(api_entry, :blocker_fingerprint)]))
+
     category = task_category(state, api_entry, runtime_entry, blocker_reason, review_path, evidence_paths)
     milestones_built = milestones(value(ledger, "milestones"))
 
@@ -317,7 +330,15 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       linear_url: "#{@linear_issue_root}/#{identifier}",
       state: safe_text(state),
       category: category,
-      current_phase: safe_text(first_present([value(ledger, "phase"), value(ledger, "last_status_phase"), value(runtime_entry, "phase")])),
+      current_phase:
+        safe_text(
+          first_present([
+            value(ledger, "phase"),
+            value(ledger, "last_status_phase"),
+            value(api_entry, :phase),
+            value(runtime_entry, "phase")
+          ])
+        ),
       started_at: first_present([value(ledger, "started_at"), value(api_entry, :started_at), value(runtime_entry, "started_at")]),
       ended_at: value(ledger, "ended_at"),
       last_event_at: first_present([value(ledger, "last_event_at"), value(api_entry, :last_event_at), value(runtime_entry, "last_event_at")]),
@@ -330,7 +351,7 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       blocker_reason: blocker_reason,
       blocker_fingerprint: blocker_fingerprint,
       blocker_hint: blocker_hint(blocker_fingerprint),
-      next_human_action: next_human_action(ledger, category),
+      next_human_action: next_human_action(ledger, api_entry, category),
       action_kind: next_action_kind(category, blocker_fingerprint, review_path, evidence_paths),
       session_id: safe_text(first_present([value(ledger, "session_id"), value(api_entry, :session_id), value(runtime_entry, "session_id")])),
       turn_count: first_present([value(ledger, "turn_count"), value(api_entry, :turn_count), value(runtime_entry, "turn_count")]),
@@ -349,6 +370,7 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
 
     cond do
       not blank?(blocker_reason) or normalized in @blocked_states -> "blocked"
+      value(api_entry, :api_status) == "blocked" -> "blocked"
       normalized in @review_states -> "in-review"
       normalized in ["running", "in progress", "symphony ready"] -> "active"
       value(api_entry, :api_status) == "retrying" or value(runtime_entry, "runtime_status") == "retrying" -> "retrying"
@@ -359,6 +381,12 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
       value(runtime_entry, "runtime_status") == "terminal" -> "terminal"
       value(runtime_entry, "runtime_status") == "stale-ready" -> "blocked"
       true -> "recent"
+    end
+  end
+
+  defp api_blocker_error(api_entry) do
+    if value(api_entry, :api_status) == "blocked" do
+      value(api_entry, :error)
     end
   end
 
@@ -427,8 +455,8 @@ defmodule SymphonyElixirWeb.OperatorDashboard do
   defp maybe_source(sources, true, source), do: [source | sources]
   defp maybe_source(sources, _condition, _source), do: sources
 
-  defp next_human_action(ledger, category) do
-    case safe_text(value(ledger, "next_human_action")) do
+  defp next_human_action(ledger, api_entry, category) do
+    case safe_text(first_present([value(ledger, "next_human_action"), value(api_entry, :next_human_action)])) do
       nil -> default_next_human_action(category)
       action -> action
     end

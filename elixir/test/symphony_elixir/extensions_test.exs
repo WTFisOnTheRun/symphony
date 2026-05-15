@@ -320,7 +320,36 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do
-    snapshot = static_snapshot()
+    blocked_started_at = DateTime.utc_now() |> DateTime.add(-90, :second)
+    blocked_completed_at = DateTime.utc_now() |> DateTime.add(-10, :second)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:blocked, [
+        %{
+          issue_id: "issue-blocked",
+          issue_identifier: "MT-BLOCK",
+          state: "NEEDS HUMAN",
+          phase: "runaway token/progress fuse",
+          worker_host: nil,
+          workspace_path: nil,
+          session_id: "thread-blocked",
+          turn_count: 3,
+          codex_input_tokens: 40,
+          codex_output_tokens: 10,
+          codex_total_tokens: 50,
+          started_at: blocked_started_at,
+          completed_at: blocked_completed_at,
+          last_event: :notification,
+          last_event_at: nil,
+          last_message: "blocked by fuse",
+          error: nil,
+          blocker_reason: "No-progress fuse tripped.",
+          blocker_fingerprint: "fuse_fingerprint",
+          next_human_action: "Inspect runner evidence before rerun."
+        }
+      ])
+
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
 
     {:ok, _pid} =
@@ -342,7 +371,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -368,6 +397,28 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "error" => "boom",
                  "worker_host" => nil,
                  "workspace_path" => nil
+               }
+             ],
+             "blocked" => [
+               %{
+                 "issue_id" => "issue-blocked",
+                 "issue_identifier" => "MT-BLOCK",
+                 "state" => "NEEDS HUMAN",
+                 "phase" => "runaway token/progress fuse",
+                 "worker_host" => nil,
+                 "workspace_path" => nil,
+                 "session_id" => "thread-blocked",
+                 "turn_count" => 3,
+                 "started_at" => DateTime.to_iso8601(DateTime.truncate(blocked_started_at, :second)),
+                 "completed_at" => DateTime.to_iso8601(DateTime.truncate(blocked_completed_at, :second)),
+                 "last_event" => "notification",
+                 "last_event_at" => nil,
+                 "last_message" => "blocked by fuse",
+                 "error" => nil,
+                 "blocker_reason" => "No-progress fuse tripped.",
+                 "blocker_fingerprint" => "fuse_fingerprint",
+                 "next_human_action" => "Inspect runner evidence before rerun.",
+                 "tokens" => %{"input_tokens" => 40, "output_tokens" => 10, "total_tokens" => 50}
                }
              ],
              "codex_totals" => %{
@@ -404,9 +455,48 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
              "retry" => nil,
+             "blocked" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
+             "tracked" => %{}
+           }
+
+    conn = get(build_conn(), "/api/v1/MT-BLOCK")
+    blocked_payload = json_response(conn, 200)
+
+    assert blocked_payload == %{
+             "issue_identifier" => "MT-BLOCK",
+             "issue_id" => "issue-blocked",
+             "status" => "blocked",
+             "workspace" => %{
+               "path" => Path.join(Config.settings!().workspace.root, "MT-BLOCK"),
+               "host" => nil
+             },
+             "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
+             "running" => nil,
+             "retry" => nil,
+             "blocked" => %{
+               "worker_host" => nil,
+               "workspace_path" => nil,
+               "session_id" => "thread-blocked",
+               "turn_count" => 3,
+               "state" => "NEEDS HUMAN",
+               "phase" => "runaway token/progress fuse",
+               "started_at" => DateTime.to_iso8601(DateTime.truncate(blocked_started_at, :second)),
+               "completed_at" => DateTime.to_iso8601(DateTime.truncate(blocked_completed_at, :second)),
+               "last_event" => "notification",
+               "last_message" => "blocked by fuse",
+               "last_event_at" => nil,
+               "error" => nil,
+               "blocker_reason" => "No-progress fuse tripped.",
+               "blocker_fingerprint" => "fuse_fingerprint",
+               "next_human_action" => "Inspect runner evidence before rerun.",
+               "tokens" => %{"input_tokens" => 40, "output_tokens" => 10, "total_tokens" => 50}
+             },
+             "logs" => %{"codex_session_logs" => []},
+             "recent_events" => [],
+             "last_error" => "No-progress fuse tripped.",
              "tracked" => %{}
            }
 
@@ -461,6 +551,57 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "operator dashboard treats API-only blocked entries as blocked review items" do
+    orchestrator_name = Module.concat(__MODULE__, :ApiOnlyBlockedOrchestrator)
+
+    snapshot =
+      empty_static_snapshot()
+      |> Map.put(:blocked, [
+        %{
+          issue_id: "issue-api-blocked",
+          issue_identifier: "MT-API-BLOCK",
+          state: "NEEDS HUMAN",
+          phase: "runaway token/progress fuse",
+          worker_host: nil,
+          workspace_path: nil,
+          session_id: "thread-api-blocked",
+          turn_count: 2,
+          codex_input_tokens: 10,
+          codex_output_tokens: 2,
+          codex_total_tokens: 12,
+          started_at: DateTime.utc_now() |> DateTime.add(-60, :second),
+          completed_at: DateTime.utc_now(),
+          last_event: :notification,
+          last_event_at: nil,
+          last_message: "blocked by API fixture",
+          error: nil,
+          blocker_reason: "API-only blocked fixture",
+          blocker_fingerprint: "api_only_blocked",
+          next_human_action: "Review API-only blocked fixture."
+        }
+      ])
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{
+          queued: true,
+          coalesced: false,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    payload = SymphonyElixirWeb.OperatorDashboard.payload(orchestrator_name, 50, dts_logs_root: dashboard_logs_root())
+
+    assert payload.counts.blocked == 1
+    assert [%{issue_identifier: "MT-API-BLOCK", category: "blocked"} = task] = payload.review_queue
+    assert task.blocker_reason == "API-only blocked fixture"
+    assert task.blocker_fingerprint == "api_only_blocked"
+    assert task.next_human_action == "Review API-only blocked fixture."
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -988,7 +1129,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 0}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
