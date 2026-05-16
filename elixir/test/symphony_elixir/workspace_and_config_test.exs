@@ -740,6 +740,287 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
   end
 
+  test "non-needs-human unresolved current ledgers ignore ordinary human comments and suppress dispatch" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-current-ledger-blockers-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    current_ledgers = [
+      {"MT-1026", "STALLED", "active agent missing from dashboard", "Unresolved STALLED control-plane blocker."},
+      {"MT-1027", "BLOCKED", "stale-ready watchdog", "Unresolved BLOCKED control-plane blocker."},
+      {"MT-1028", "RUNNING", "runaway token/progress fuse", "No durable progress after additional tokens."},
+      {"MT-1029", "QUEUED", "queued", "Contradictory queued ledger still carries an unresolved blocker."}
+    ]
+
+    for {identifier, state, phase, blocker_reason} <- current_ledgers do
+      File.write!(
+        Path.join(ledger_root, "#{identifier}.json"),
+        Jason.encode!(%{
+          state: state,
+          phase: phase,
+          blocker_reason: blocker_reason,
+          blocker_fingerprint: "ordinary-comment-#{String.downcase(state)}",
+          resolved_blocker_fingerprints: []
+        })
+      )
+
+      issue = %Issue{
+        id: "current-ledger-#{identifier}",
+        identifier: identifier,
+        title: "Current #{state} blocker",
+        state: "Todo",
+        description: "Ready issue with ordinary human comment.",
+        comments: [%{body: "Ordinary human comment, not an explicit resolution.", created_at: ~U[2026-05-15 20:00:00Z]}]
+      }
+
+      refute Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+
+      assert {:skip, :ledger_blocker} =
+               Orchestrator.dispatch_prelaunch_decision_for_test(issue, fn [issue_id] ->
+                 assert issue_id == issue.id
+                 {:ok, [issue]}
+               end)
+    end
+  end
+
+  test "active stalled blocked and no-progress observability ledgers with unresolved blockers are not dispatch-eligible" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-active-ledger-blockers-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    assert Orchestrator.should_dispatch_issue_for_test(
+             issue_with_description("MT-1018", "Ready issue without unresolved ledger."),
+             dispatch_state()
+           )
+
+    blocked_ledgers = [
+      {"MT-1016", "STALLED", "active agent missing from dashboard", "Runner already recorded an unresolved STALLED control-plane blocker."},
+      {"MT-1017", "BLOCKED", "stale-ready watchdog", "Runner already recorded an unresolved BLOCKED control-plane blocker."},
+      {"MT-1019", "RUNNING", "runaway token/progress fuse", "No durable progress after 2103683 additional tokens."}
+    ]
+
+    for {identifier, state, phase, blocker_reason} <- blocked_ledgers do
+      File.write!(
+        Path.join(ledger_root, "#{identifier}.json"),
+        Jason.encode!(%{
+          state: state,
+          phase: phase,
+          blocker_reason: blocker_reason,
+          blocker_fingerprint: "unresolved-#{String.downcase(state)}-blocker",
+          resolved_blocker_fingerprints: []
+        })
+      )
+
+      issue = issue_with_description(identifier, "Ready issue after unresolved #{state} ledger.")
+
+      refute Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+    end
+  end
+
+  test "current queued ledger with unresolved blocker suppresses dispatch unless fingerprint is resolved" do
+    with_observability_ledger("MT-1024", %{
+      state: "QUEUED",
+      phase: "queued",
+      blocker_reason: "Contradictory current ledger still carries an unresolved blocker.",
+      blocker_fingerprint: "queued-unresolved-blocker",
+      resolved_blocker_fingerprints: []
+    })
+
+    unresolved_issue = issue_with_description("MT-1024", "Ready issue with contradictory unresolved queued ledger.")
+    refute Orchestrator.should_dispatch_issue_for_test(unresolved_issue, dispatch_state())
+
+    with_observability_ledger("MT-1025", %{
+      state: "QUEUED",
+      phase: "queued",
+      blocker_reason: "Contradictory queued ledger was resolved explicitly.",
+      blocker_fingerprint: "queued-resolved-blocker",
+      resolved_blocker_fingerprints: ["queued-resolved-blocker"]
+    })
+
+    resolved_issue = issue_with_description("MT-1025", "Ready issue with explicitly resolved queued ledger.")
+    assert Orchestrator.should_dispatch_issue_for_test(resolved_issue, dispatch_state())
+  end
+
+  test "resolved fingerprints bypass active blocker ledgers" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-active-ledger-resolution-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    File.write!(
+      Path.join(ledger_root, "MT-1022.json"),
+      Jason.encode!(%{
+        state: "STALLED",
+        phase: "active agent missing from dashboard",
+        blocker_reason: "Runner recorded an unresolved STALLED control-plane blocker.",
+        blocker_fingerprint: "stalled-fingerprint",
+        resolved_blocker_fingerprints: ["stalled-fingerprint"]
+      })
+    )
+
+    assert Orchestrator.should_dispatch_issue_for_test(
+             issue_with_description("MT-1022", "Ready issue after resolved stalled ledger."),
+             dispatch_state()
+           )
+
+  end
+
+  test "needs-human resolved blocker fingerprint bypasses dispatch suppression" do
+    with_observability_ledger("MT-1030", %{
+      state: "NEEDS HUMAN",
+      blocker_reason: "Human intervention was required before explicit resolution.",
+      blocker_fingerprint: "needs-human-resolved-fingerprint",
+      resolved_blocker_fingerprints: ["needs-human-resolved-fingerprint"]
+    })
+
+    issue = issue_with_description("MT-1030", "Ready issue after explicit NEEDS HUMAN resolution.")
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+    assert {:ok, %Issue{identifier: "MT-1030"}} = Orchestrator.dispatch_prelaunch_decision_for_test(issue, fn [_issue_id] -> {:ok, [issue]} end)
+  end
+
+  test "historical unrelated observability ledgers do not suppress the current issue" do
+    with_observability_ledger("MT-1031-HISTORICAL", %{
+      state: "STALLED",
+      blocker_reason: "Historical unrelated blocker.",
+      blocker_fingerprint: "historical-unrelated-blocker",
+      resolved_blocker_fingerprints: []
+    })
+
+    issue = issue_with_description("MT-1031", "Ready issue without a current applicable ledger.")
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+    assert {:ok, %Issue{identifier: "MT-1031"}} = Orchestrator.dispatch_prelaunch_decision_for_test(issue, fn [_issue_id] -> {:ok, [issue]} end)
+  end
+
+  test "dispatch launch boundary rechecks observability ledgers after issue refresh" do
+    previous_log_file = Application.get_env(:symphony_elixir, :log_file)
+    logs_root = Path.join(System.tmp_dir!(), "symphony-elixir-launch-boundary-ledger-#{System.unique_integer([:positive])}")
+    ledger_root = Path.join(logs_root, "ledger")
+    File.mkdir_p!(ledger_root)
+    Application.put_env(:symphony_elixir, :log_file, SymphonyElixir.LogFile.default_log_file(logs_root))
+
+    on_exit(fn ->
+      if is_nil(previous_log_file) do
+        Application.delete_env(:symphony_elixir, :log_file)
+      else
+        Application.put_env(:symphony_elixir, :log_file, previous_log_file)
+      end
+
+      File.rm_rf(logs_root)
+    end)
+
+    issue = issue_with_description("MT-1023", "Ready issue before the launch-boundary ledger appears.")
+    assert Orchestrator.should_dispatch_issue_for_test(issue, dispatch_state())
+
+    fetcher = fn [issue_id] ->
+      assert issue_id == issue.id
+
+      File.write!(
+        Path.join(ledger_root, "MT-1023.json"),
+        Jason.encode!(%{
+          state: "STALLED",
+          phase: "active agent missing from dashboard",
+          blocker_reason: "Ledger appeared after eligibility but before launch.",
+          blocker_fingerprint: "launch-boundary-blocker",
+          resolved_blocker_fingerprints: []
+        })
+      )
+
+      {:ok, [issue]}
+    end
+
+    assert {:skip, :ledger_blocker} = Orchestrator.dispatch_prelaunch_decision_for_test(issue, fetcher)
+  end
+
+  test "design-only subagent-fork required capability is not dispatch-eligible" do
+    previous_registry_path = Application.get_env(:symphony_elixir, :dts_capability_registry_path)
+
+    registry_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-capability-registry-#{System.unique_integer([:positive])}"
+      )
+
+    registry_path = Path.join(registry_root, "capabilities.json")
+    File.mkdir_p!(registry_root)
+
+    File.write!(
+      registry_path,
+      Jason.encode!(%{
+        capabilities: [
+          %{capability_id: "git-local-worktree", status: "unattended_allowed"},
+          %{capability_id: "subagent-fork", status: "design_only"}
+        ]
+      })
+    )
+
+    Application.put_env(:symphony_elixir, :dts_capability_registry_path, registry_path)
+
+    on_exit(fn ->
+      if is_nil(previous_registry_path) do
+        Application.delete_env(:symphony_elixir, :dts_capability_registry_path)
+      else
+        Application.put_env(:symphony_elixir, :dts_capability_registry_path, previous_registry_path)
+      end
+
+      File.rm_rf(registry_root)
+    end)
+
+    allowed_issue =
+      issue_with_description("MT-1020", """
+      ## Required Capabilities
+
+      * `git-local-worktree`: inspect, edit, and test exact local paths.
+      """)
+
+    blocked_issue =
+      issue_with_description("MT-1021", """
+      ## Required Capabilities
+
+      * `git-local-worktree`: inspect, edit, and test exact local paths.
+      * `subagent-fork`: isolate context-heavy work.
+      """)
+
+    assert Orchestrator.should_dispatch_issue_for_test(allowed_issue, dispatch_state())
+    refute Orchestrator.should_dispatch_issue_for_test(blocked_issue, dispatch_state())
+  end
+
   test "issue assigned to another worker is not dispatch-eligible" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_assignee: "dev@example.com")
 

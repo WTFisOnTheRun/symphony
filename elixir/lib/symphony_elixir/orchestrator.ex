@@ -13,6 +13,8 @@ defmodule SymphonyElixir.Orchestrator do
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   @default_dts_logs_root "C:/Users/Elvis/Dev/dts-symphony-runner-logs"
+  @default_dts_capability_registry_path "C:/Users/Elvis/Dev/dts-symphony-workbench/capabilities.json"
+  @dispatch_blocking_capability_statuses MapSet.new(["blocked", "design_only", "interactive_only"])
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @durable_workspace_extensions [".md", ".txt", ".json", ".html", ".png", ".jpg", ".jpeg", ".webp", ".log"]
@@ -342,6 +344,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @doc false
+  @spec dispatch_prelaunch_decision_for_test(Issue.t(), ([String.t()] -> term())) ::
+          {:ok, Issue.t()} | {:skip, term()} | {:error, term()}
+  def dispatch_prelaunch_decision_for_test(%Issue{} = issue, issue_fetcher)
+      when is_function(issue_fetcher, 1) do
+    case revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set()) do
+      {:ok, %Issue{} = refreshed_issue} ->
+        dispatch_prelaunch_decision(refreshed_issue)
+
+      other ->
+        other
+    end
+  end
+
+  @doc false
   @spec sort_issues_for_dispatch_for_test([Issue.t()]) :: [Issue.t()]
   def sort_issues_for_dispatch_for_test(issues) when is_list(issues) do
     sort_issues_for_dispatch(issues)
@@ -537,7 +553,8 @@ defmodule SymphonyElixir.Orchestrator do
       blocker_reason: message,
       blocker_fingerprint: fingerprint,
       next_human_action: "Repair the runner child-runtime/preflight or update the Goal Contract with an explicit opt-out before rerun.",
-      completed_at: now
+      completed_at: now,
+      ended_at: now
     })
   end
 
@@ -781,6 +798,7 @@ defmodule SymphonyElixir.Orchestrator do
       !Map.has_key?(running, issue.id) and
       !completed_issue_waiting_for_update?(issue, state) and
       !ledger_blocks_dispatch?(issue) and
+      !capability_registry_blocks_dispatch?(issue) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -880,7 +898,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        case dispatch_prelaunch_decision(refreshed_issue) do
+          {:ok, dispatchable_issue} ->
+            do_dispatch_issue(state, dispatchable_issue, attempt, preferred_worker_host)
+
+          {:skip, _reason} ->
+            state
+        end
 
       {:skip, :missing} ->
         Logger.info("Skipping dispatch; issue no longer active or visible: #{issue_context(issue)}")
@@ -894,6 +918,19 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} ->
         Logger.warning("Skipping dispatch; issue refresh failed for #{issue_context(issue)}: #{inspect(reason)}")
         state
+    end
+  end
+
+  defp dispatch_prelaunch_decision(%Issue{} = refreshed_issue) do
+    cond do
+      ledger_blocks_dispatch?(refreshed_issue) ->
+        {:skip, :ledger_blocker}
+
+      capability_registry_blocks_dispatch?(refreshed_issue) ->
+        {:skip, :capability_registry}
+
+      true ->
+        {:ok, refreshed_issue}
     end
   end
 
@@ -1676,6 +1713,10 @@ defmodule SymphonyElixir.Orchestrator do
         current_human_activity_at = latest_human_activity_at(issue)
 
         cond do
+          resolved_ledger_blocker?(ledger) ->
+            log_needs_human_ledger_bypass(issue, "blocker fingerprint resolved")
+            false
+
           human_activity_newer?(current_human_activity_at, ledger_human_activity_at) ->
             log_needs_human_ledger_bypass(issue, "newer human activity")
             false
@@ -1693,12 +1734,17 @@ defmodule SymphonyElixir.Orchestrator do
         end
 
       %{} = ledger ->
-        if ended_ledger_with_unresolved_blocker?(ledger) do
-          Logger.info("Skipping dispatch for #{issue_context(issue)}; observability ledger has ended_at and an unresolved blocker")
+        cond do
+          unresolved_blocker?(ledger) ->
+            Logger.info("Skipping dispatch for #{issue_context(issue)}; observability ledger has an unresolved control-plane blocker")
+            true
 
-          true
-        else
-          false
+          ended_ledger_with_unresolved_blocker?(ledger) ->
+            Logger.info("Skipping dispatch for #{issue_context(issue)}; observability ledger has ended_at and an unresolved blocker")
+            true
+
+          true ->
+            false
         end
 
       _ledger ->
@@ -1707,6 +1753,114 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp ledger_blocks_dispatch?(_issue), do: false
+
+  defp capability_registry_blocks_dispatch?(%Issue{description: description} = issue) do
+    capability_ids = required_capability_ids(description)
+
+    if capability_ids == [] do
+      false
+    else
+      case read_capability_registry() do
+        {:ok, registry} ->
+          unavailable =
+            Enum.filter(capability_ids, fn capability_id ->
+              capability_unavailable_for_dispatch?(registry, capability_id)
+            end)
+
+          if unavailable == [] do
+            false
+          else
+            Logger.warning("Skipping dispatch for #{issue_context(issue)}; required capabilities unavailable: #{Enum.join(unavailable, ", ")}")
+            true
+          end
+
+        {:error, reason} ->
+          Logger.warning("Skipping dispatch for #{issue_context(issue)}; capability registry unavailable: #{inspect(reason)}")
+          true
+      end
+    end
+  end
+
+  defp capability_registry_blocks_dispatch?(_issue), do: false
+
+  defp required_capability_ids(description) when is_binary(description) do
+    {_in_section?, ids} =
+      description
+      |> String.split(~r/\R/, trim: false)
+      |> Enum.reduce({false, []}, fn line, {in_section?, ids} ->
+        trimmed = String.trim(line)
+
+        cond do
+          Regex.match?(~r/^##+\s+Required Capabilities\b/i, trimmed) ->
+            {true, ids}
+
+          in_section? and Regex.match?(~r/^##+\s+/, trimmed) ->
+            {false, ids}
+
+          in_section? ->
+            case required_capability_id_from_line(line) do
+              nil -> {true, ids}
+              capability_id -> {true, [capability_id | ids]}
+            end
+
+          true ->
+            {false, ids}
+        end
+      end)
+
+    ids
+    |> Enum.reverse()
+    |> Enum.uniq()
+  end
+
+  defp required_capability_ids(_description), do: []
+
+  defp required_capability_id_from_line(line) when is_binary(line) do
+    case Regex.run(~r/^\s*[-*]\s*`?([A-Za-z0-9_.-]+)`?(?:\s*:|\s+-|\s|$)/, line) do
+      [_match, capability_id] -> String.downcase(capability_id)
+      _ -> nil
+    end
+  end
+
+  defp read_capability_registry do
+    path = Application.get_env(:symphony_elixir, :dts_capability_registry_path, @default_dts_capability_registry_path)
+
+    with {:ok, body} <- File.read(path),
+         {:ok, %{"capabilities" => capabilities}} <- Jason.decode(body),
+         true <- is_list(capabilities) do
+      registry =
+        capabilities
+        |> Enum.filter(&is_map/1)
+        |> Map.new(fn capability ->
+          {capability |> Map.get("capability_id") |> normalized_ledger_value() |> String.downcase(), capability}
+        end)
+
+      {:ok, registry}
+    else
+      false -> {:error, :invalid_capabilities}
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_registry}
+    end
+  end
+
+  defp capability_unavailable_for_dispatch?(registry, capability_id) when is_map(registry) and is_binary(capability_id) do
+    case Map.get(registry, capability_id) do
+      nil ->
+        true
+
+      %{} = capability ->
+        status =
+          capability
+          |> Map.get("status")
+          |> normalized_ledger_value()
+          |> String.downcase()
+
+        status == "" or MapSet.member?(@dispatch_blocking_capability_statuses, status)
+
+      _ ->
+        true
+    end
+  end
 
   defp log_needs_human_ledger_bypass(%Issue{} = issue, reason) do
     Logger.info("Allowing dispatch for #{issue_context(issue)} despite NEEDS HUMAN observability ledger; #{reason}")
@@ -1731,6 +1885,13 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp ended_ledger_with_unresolved_blocker?(_ledger), do: false
+
+  defp resolved_ledger_blocker?(ledger) when is_map(ledger) do
+    fingerprint = normalized_ledger_value(Map.get(ledger, "blocker_fingerprint"))
+    fingerprint != "" and resolved_blocker_fingerprint?(ledger, fingerprint)
+  end
+
+  defp resolved_ledger_blocker?(_ledger), do: false
 
   defp unresolved_blocker?(ledger) when is_map(ledger) do
     fingerprint = normalized_ledger_value(Map.get(ledger, "blocker_fingerprint"))

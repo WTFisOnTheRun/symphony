@@ -2346,6 +2346,7 @@ defmodule SymphonyElixir.CoreTest do
     refute Map.has_key?(updated.running, "issue-streaming-fuse")
     assert updated.completed["issue-streaming-fuse"].state == "NEEDS HUMAN"
     assert updated.completed["issue-streaming-fuse"].error =~ "No durable progress"
+    assert updated.completed["issue-streaming-fuse"].ended_at == now
   end
 
   test "material workspace evidence changes reset durable progress before the time fuse" do
