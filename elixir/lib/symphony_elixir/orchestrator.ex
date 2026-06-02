@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, OperatorInputHandoff, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -725,19 +725,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
-    blocked_entry = %{
-      issue_id: issue_id,
-      identifier: Map.get(running_entry, :identifier, issue_id),
-      issue: Map.get(running_entry, :issue),
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      session_id: running_entry_session_id(running_entry),
-      error: error,
-      blocked_at: DateTime.utc_now(),
-      last_codex_message: Map.get(running_entry, :last_codex_message),
-      last_codex_event: Map.get(running_entry, :last_codex_event),
-      last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
-    }
+    blocked_entry =
+      %{
+        issue_id: issue_id,
+        identifier: Map.get(running_entry, :identifier, issue_id),
+        issue: Map.get(running_entry, :issue),
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        session_id: running_entry_session_id(running_entry),
+        error: error,
+        blocked_at: DateTime.utc_now(),
+        last_codex_message: Map.get(running_entry, :last_codex_message),
+        last_codex_event: Map.get(running_entry, :last_codex_event),
+        last_codex_timestamp: Map.get(running_entry, :last_codex_timestamp)
+      }
+      |> persist_operator_input_handoff()
 
     %{
       state
@@ -747,6 +749,51 @@ defmodule SymphonyElixir.Orchestrator do
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
     }
   end
+
+  defp persist_operator_input_handoff(blocked_entry) do
+    handoff_state = Config.settings!().tracker.operator_input_handoff_state
+    packet_result = OperatorInputHandoff.persist_blocker(blocked_entry)
+    comment_body = OperatorInputHandoff.comment_body(blocked_entry, packet_result, handoff_state)
+    comment_result = tracker_create_comment(blocked_entry.issue_id, comment_body)
+    state_result = tracker_update_issue_state(blocked_entry.issue_id, handoff_state)
+
+    blocked_entry
+    |> Map.put(:blocker_fingerprint, OperatorInputHandoff.fingerprint())
+    |> Map.put(:durable_packet_path, durable_packet_path(packet_result))
+    |> Map.put(:handoff_state, handoff_state)
+    |> Map.put(:handoff_comment_result, comment_result)
+    |> Map.put(:handoff_state_result, state_result)
+  end
+
+  defp tracker_create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do
+    case Tracker.create_comment(issue_id, body) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("Operator-input handoff comment failed for issue_id=#{issue_id}: #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp tracker_create_comment(_issue_id, _body), do: {:error, :missing_issue_id}
+
+  defp tracker_update_issue_state(issue_id, handoff_state)
+       when is_binary(issue_id) and is_binary(handoff_state) and handoff_state != "" do
+    case Tracker.update_issue_state(issue_id, handoff_state) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("Operator-input handoff state update failed for issue_id=#{issue_id} state=#{handoff_state}: #{inspect(reason)}")
+        error
+    end
+  end
+
+  defp tracker_update_issue_state(_issue_id, _handoff_state), do: {:error, :missing_handoff_state}
+
+  defp durable_packet_path({:ok, %{"packet_path" => packet_path}}), do: packet_path
+  defp durable_packet_path(_packet_result), do: nil
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()
@@ -794,6 +841,7 @@ defmodule SymphonyElixir.Orchestrator do
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
+      !OperatorInputHandoff.unresolved_blocker?(issue) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -1394,6 +1442,11 @@ defmodule SymphonyElixir.Orchestrator do
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: Map.get(metadata, :session_id),
+          blocker_fingerprint: Map.get(metadata, :blocker_fingerprint),
+          durable_packet_path: Map.get(metadata, :durable_packet_path),
+          handoff_state: Map.get(metadata, :handoff_state),
+          handoff_comment_result: Map.get(metadata, :handoff_comment_result),
+          handoff_state_result: Map.get(metadata, :handoff_state_result),
           error: Map.get(metadata, :error),
           blocked_at: Map.get(metadata, :blocked_at),
           last_codex_timestamp: Map.get(metadata, :last_codex_timestamp),
