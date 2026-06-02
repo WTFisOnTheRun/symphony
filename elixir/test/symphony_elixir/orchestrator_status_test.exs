@@ -1144,6 +1144,38 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute rendered =~ "Timestamp:"
   end
 
+  test "status dashboard is disabled by explicit headless mode" do
+    previous_mode = System.get_env("SYMPHONY_STATUS_DASHBOARD")
+    on_exit(fn -> restore_env("SYMPHONY_STATUS_DASHBOARD", previous_mode) end)
+
+    System.put_env("SYMPHONY_STATUS_DASHBOARD", "headless")
+
+    refute StatusDashboard.dashboard_enabled_for_test?()
+  end
+
+  test "status dashboard keeps rendering when explicitly interactive" do
+    previous_mode = System.get_env("SYMPHONY_STATUS_DASHBOARD")
+    on_exit(fn -> restore_env("SYMPHONY_STATUS_DASHBOARD", previous_mode) end)
+
+    System.put_env("SYMPHONY_STATUS_DASHBOARD", "interactive")
+
+    assert StatusDashboard.dashboard_enabled_for_test?()
+  end
+
+  test "status dashboard suppresses terminal repaint frames in headless mode" do
+    previous_mode = System.get_env("SYMPHONY_STATUS_DASHBOARD")
+    on_exit(fn -> restore_env("SYMPHONY_STATUS_DASHBOARD", previous_mode) end)
+
+    System.put_env("SYMPHONY_STATUS_DASHBOARD", "headless")
+
+    rendered =
+      ExUnit.CaptureIO.capture_io(fn ->
+        assert :ok = StatusDashboard.render_to_terminal_for_test("SYMPHONY STATUS\nNext refresh: 1s")
+      end)
+
+    assert rendered == ""
+  end
+
   test "status dashboard renders linear project link in header" do
     snapshot_data =
       {:ok,

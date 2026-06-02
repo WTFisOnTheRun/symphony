@@ -466,12 +466,16 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp render_to_terminal(content) do
-    IO.write([
-      IO.ANSI.home(),
-      IO.ANSI.clear(),
-      normalize_status_lines(content),
-      "\n"
-    ])
+    if terminal_repaint_enabled?() do
+      IO.write([
+        IO.ANSI.home(),
+        IO.ANSI.clear(),
+        normalize_status_lines(content),
+        "\n"
+      ])
+    end
+
+    :ok
   end
 
   defp update_token_samples(samples, now_ms, total_tokens) do
@@ -546,6 +550,14 @@ defmodule SymphonyElixir.StatusDashboard do
           String.t() | nil
   def dashboard_url_for_test(host, configured_port, bound_port),
     do: dashboard_url(host, configured_port, bound_port)
+
+  @doc false
+  @spec dashboard_enabled_for_test?() :: boolean()
+  def dashboard_enabled_for_test?, do: dashboard_enabled?()
+
+  @doc false
+  @spec render_to_terminal_for_test(String.t()) :: :ok
+  def render_to_terminal_for_test(content), do: render_to_terminal(content)
 
   defp snapshot_payload do
     if Process.whereis(Orchestrator) do
@@ -1932,6 +1944,49 @@ defmodule SymphonyElixir.StatusDashboard do
   defp truncate(value, _max), do: value
 
   defp dashboard_enabled? do
+    case explicit_dashboard_mode() do
+      :enabled -> true
+      :disabled -> false
+      :auto -> mix_dashboard_enabled?()
+    end
+  end
+
+  defp terminal_repaint_enabled?, do: explicit_dashboard_mode() != :disabled
+
+  defp explicit_dashboard_mode do
+    case System.get_env("SYMPHONY_STATUS_DASHBOARD") do
+      nil ->
+        :auto
+
+      value ->
+        value
+        |> String.trim()
+        |> String.downcase()
+        |> dashboard_mode_from_env()
+    end
+  end
+
+  defp dashboard_mode_from_env(value)
+       when value in [
+              "0",
+              "false",
+              "off",
+              "disabled",
+              "disable",
+              "headless",
+              "background",
+              "noninteractive",
+              "non-interactive"
+            ],
+       do: :disabled
+
+  defp dashboard_mode_from_env(value)
+       when value in ["1", "true", "on", "enabled", "enable", "interactive", "terminal", "tty"],
+       do: :enabled
+
+  defp dashboard_mode_from_env(_value), do: :auto
+
+  defp mix_dashboard_enabled? do
     if Code.ensure_loaded?(Mix) and function_exported?(Mix, :env, 0) do
       try do
         Mix.env() != :test
