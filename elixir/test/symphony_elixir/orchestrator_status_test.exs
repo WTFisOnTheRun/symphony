@@ -962,12 +962,30 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   end
 
   test "orchestrator blocks stalled workers that are waiting on MCP elicitation" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-mcp-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = yaml_path(Path.join(test_root, "workspaces"))
+    workspace_path = Path.join(workspace_root, "MT-MCP")
+    File.mkdir_p!(workspace_path)
+    on_exit(fn -> File.rm_rf(test_root) end)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
     write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
       tracker_api_token: nil,
-      codex_stall_timeout_ms: 1_000
+      codex_stall_timeout_ms: 1_000,
+      workspace_root: workspace_root,
+      tracker_operator_input_handoff_state: "In Review"
     )
 
     issue_id = "issue-mcp-elicitation-stall"
+    tracking_issue = %Issue{id: issue_id, identifier: "MT-MCP", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [tracking_issue])
+
     orchestrator_name = Module.concat(__MODULE__, :McpElicitationBlockOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
@@ -991,9 +1009,9 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       pid: worker_pid,
       ref: make_ref(),
       identifier: "MT-MCP",
-      issue: %Issue{id: issue_id, identifier: "MT-MCP", state: "In Progress"},
+      issue: tracking_issue,
       worker_host: "dm-dev2",
-      workspace_path: "/workspaces/MT-MCP",
+      workspace_path: workspace_path,
       session_id: "thread-mcp-turn-mcp",
       last_codex_message: %{
         event: :notification,
@@ -1024,17 +1042,57 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              identifier: "MT-MCP",
              error: "codex MCP elicitation requires operator input",
              worker_host: "dm-dev2",
-             workspace_path: "/workspaces/MT-MCP"
+             workspace_path: ^workspace_path,
+             blocker_fingerprint: "operator_input_required",
+             durable_packet_path: durable_packet_path,
+             handoff_state: "In Review",
+             handoff_comment_result: :ok,
+             handoff_state_result: :ok
            } = state.blocked[issue_id]
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment_body}, 500
+    assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 500
+    assert comment_body =~ "blocker_fingerprint: operator_input_required"
+    assert comment_body =~ "mcpServer/elicitation/request"
+    assert same_path?(durable_packet_path, Path.join([workspace_path, ".symphony", "operator-input-blocker.json"]))
+
+    packet = durable_packet!(workspace_path)
+    assert packet["issue"]["id"] == issue_id
+    assert packet["issue"]["identifier"] == "MT-MCP"
+    assert packet["session_id"] == "thread-mcp-turn-mcp"
+    assert packet["workspace_path"] == workspace_path
+    assert packet["blocker_fingerprint"] == "operator_input_required"
+    assert packet["current_linear_state"] == "In Progress"
+    assert packet["next_elvis_action"] =~ "OPERATOR_INPUT.md"
+    assert packet["re_release_rule"] =~ "new attempt"
+    assert get_in(packet, ["input_request_or_approval_summary", "method"]) == "mcpServer/elicitation/request"
 
     assert %{blocked: [%{identifier: "MT-MCP", error: "codex MCP elicitation requires operator input"}]} =
              Orchestrator.snapshot(orchestrator_name, 1_000)
   end
 
   test "orchestrator blocks failed workers after app-server reports input required" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil)
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-input-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = yaml_path(Path.join(test_root, "workspaces"))
+    on_exit(fn -> File.rm_rf(test_root) end)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      workspace_root: workspace_root,
+      tracker_operator_input_handoff_state: "In Review"
+    )
 
     issue_id = "issue-input-required"
+    tracking_issue = %Issue{id: issue_id, identifier: "MT-INPUT", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [tracking_issue])
+
     orchestrator_name = Module.concat(__MODULE__, :InputRequiredBlockOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
@@ -1052,7 +1110,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       pid: self(),
       ref: ref,
       identifier: "MT-INPUT",
-      issue: %Issue{id: issue_id, identifier: "MT-INPUT", state: "In Progress"},
+      issue: tracking_issue,
       session_id: "thread-input-turn-input",
       last_codex_message: %{
         event: :turn_input_required,
@@ -1080,14 +1138,46 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT",
-             error: "codex turn requires operator input"
+             error: "codex turn requires operator input",
+             blocker_fingerprint: "operator_input_required",
+             durable_packet_path: durable_packet_path,
+             handoff_state_result: :ok
            } = state.blocked[issue_id]
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment_body}, 500
+    assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 500
+    assert comment_body =~ "turn_input_required"
+    assert same_path?(durable_packet_path, Path.join([workspace_root, "MT-INPUT", ".symphony", "operator-input-blocker.json"]))
+
+    packet = durable_packet!(Path.join(workspace_root, "MT-INPUT"))
+    assert packet["blocker_fingerprint"] == "operator_input_required"
+    assert packet["session_id"] == "thread-input-turn-input"
+    assert packet["current_linear_state"] == "In Progress"
+    assert get_in(packet, ["input_request_or_approval_summary", "method"]) == "mcpServer/elicitation/request"
   end
 
   test "orchestrator blocks normal worker exits after input required completion" do
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_api_token: nil)
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-normal-input-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = yaml_path(Path.join(test_root, "workspaces"))
+    on_exit(fn -> File.rm_rf(test_root) end)
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_api_token: nil,
+      workspace_root: workspace_root,
+      tracker_operator_input_handoff_state: "In Review"
+    )
 
     issue_id = "issue-input-required-normal"
+    tracking_issue = %Issue{id: issue_id, identifier: "MT-INPUT-NORMAL", state: "In Progress"}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [tracking_issue])
+
     orchestrator_name = Module.concat(__MODULE__, :InputRequiredNormalBlockOrchestrator)
     {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
 
@@ -1104,7 +1194,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       pid: self(),
       ref: ref,
       identifier: "MT-INPUT-NORMAL",
-      issue: %Issue{id: issue_id, identifier: "MT-INPUT-NORMAL", state: "In Progress"},
+      issue: tracking_issue,
       session_id: "thread-input-normal",
       completion: %{outcome: :input_required},
       last_codex_message: nil,
@@ -1130,8 +1220,93 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
     assert %{
              identifier: "MT-INPUT-NORMAL",
-             error: "codex turn requires operator input"
+             error: "codex turn requires operator input",
+             blocker_fingerprint: "operator_input_required",
+             durable_packet_path: durable_packet_path,
+             handoff_state_result: :ok
            } = state.blocked[issue_id]
+
+    assert_receive {:memory_tracker_comment, ^issue_id, comment_body}, 500
+    assert_receive {:memory_tracker_state_update, ^issue_id, "In Review"}, 500
+    assert comment_body =~ "codex turn requires operator input"
+
+    assert same_path?(
+             durable_packet_path,
+             Path.join([workspace_root, "MT-INPUT-NORMAL", ".symphony", "operator-input-blocker.json"])
+           )
+
+    packet = durable_packet!(Path.join(workspace_root, "MT-INPUT-NORMAL"))
+    assert packet["blocker_fingerprint"] == "operator_input_required"
+    assert packet["session_id"] == "thread-input-normal"
+    assert packet["current_linear_state"] == "In Progress"
+  end
+
+  test "durable operator-input blocker suppresses restart pickup until input is present" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-orchestrator-restart-handoff-#{System.unique_integer([:positive])}"
+      )
+
+    workspace_root = yaml_path(Path.join(test_root, "workspaces"))
+    workspace = Path.join(workspace_root, "MT-RESTART")
+    File.mkdir_p!(Path.join(workspace, ".symphony"))
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Symphony Ready"],
+      workspace_root: workspace_root
+    )
+
+    issue = %Issue{
+      id: "issue-restart-handoff",
+      identifier: "MT-RESTART",
+      title: "Restart-safe input",
+      description: "Continue after operator input",
+      state: "Symphony Ready"
+    }
+
+    File.write!(
+      Path.join([workspace, ".symphony", "operator-input-blocker.json"]),
+      Jason.encode!(%{
+        "blocker_fingerprint" => "operator_input_required",
+        "issue" => %{"id" => issue.id, "identifier" => issue.identifier},
+        "re_release_rule" => "Add durable input before returning to Symphony Ready."
+      })
+    )
+
+    state = %Orchestrator.State{
+      max_concurrent_agents: 1,
+      running: %{},
+      claimed: MapSet.new(),
+      blocked: %{},
+      retry_attempts: %{}
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    File.write!(
+      Path.join(workspace, "OPERATOR_INPUT.md"),
+      "Elvis input: continue with the supplied approval and do not restart from scratch."
+    )
+
+    assert Orchestrator.should_dispatch_issue_for_test(issue, state)
+
+    claimed_state = %{state | claimed: MapSet.new([issue.id])}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, claimed_state)
+
+    blocked_state = %{state | blocked: %{issue.id => %{blocker_fingerprint: "operator_input_required"}}}
+    refute Orchestrator.should_dispatch_issue_for_test(issue, blocked_state)
+
+    review_issue = %{issue | state: "In Review"}
+    refute Orchestrator.should_dispatch_issue_for_test(review_issue, state)
+
+    prompt = AgentRunner.build_turn_prompt_for_test(workspace, issue)
+    assert prompt =~ "Operator input handoff context"
+    assert prompt =~ "not a live Codex thread resume"
+    assert prompt =~ "operator-input-blocker.json"
+    assert prompt =~ "Elvis input: continue with the supplied approval"
   end
 
   test "status dashboard renders offline marker to terminal" do
@@ -1760,6 +1935,21 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
   defp wait_for_snapshot(pid, predicate, timeout_ms \\ 200) when is_function(predicate, 1) do
     deadline_ms = System.monotonic_time(:millisecond) + timeout_ms
     do_wait_for_snapshot(pid, predicate, deadline_ms)
+  end
+
+  defp durable_packet!(workspace) do
+    workspace
+    |> Path.join(".symphony/operator-input-blocker.json")
+    |> File.read!()
+    |> Jason.decode!()
+  end
+
+  defp yaml_path(path) when is_binary(path) do
+    String.replace(path, "\\", "/")
+  end
+
+  defp same_path?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(yaml_path(left)) == String.downcase(yaml_path(right))
   end
 
   defp do_wait_for_snapshot(pid, predicate, deadline_ms) do

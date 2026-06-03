@@ -5,7 +5,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{Config, Linear.Issue, OperatorInputHandoff, PromptBuilder, Tracker, Workspace}
 
   @type worker_host :: String.t() | nil
 
@@ -90,7 +90,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
-    prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
+    prompt = build_turn_prompt(workspace, issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
            AppServer.run_turn(
@@ -130,9 +130,17 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  @doc false
+  @spec build_turn_prompt_for_test(Path.t(), Issue.t(), keyword()) :: String.t()
+  def build_turn_prompt_for_test(workspace, issue, opts \\ []) do
+    build_turn_prompt(workspace, issue, opts, 1, 1)
+  end
 
-  defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
+  defp build_turn_prompt(workspace, issue, opts, 1, _max_turns) do
+    PromptBuilder.build_prompt(issue, opts) <> OperatorInputHandoff.prompt_context(workspace, issue)
+  end
+
+  defp build_turn_prompt(_workspace, _issue, _opts, turn_number, max_turns) do
     """
     Continuation guidance:
 
