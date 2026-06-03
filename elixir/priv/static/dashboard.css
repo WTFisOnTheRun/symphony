@@ -214,24 +214,24 @@ pre,
   opacity: 0.9;
 }
 
-.status-badge-live {
+.status-badge-ui-connected {
   display: none;
   background: var(--accent-soft);
   border-color: rgba(16, 163, 127, 0.18);
   color: var(--accent-ink);
 }
 
-.status-badge-offline {
+.status-badge-ui-disconnected {
   background: #f5f5f7;
   border-color: var(--line-strong);
   color: var(--muted);
 }
 
-[data-phx-main].phx-connected .status-badge-live {
+[data-phx-main].phx-connected .status-badge-ui-connected {
   display: inline-flex;
 }
 
-[data-phx-main].phx-connected .status-badge-offline {
+[data-phx-main].phx-connected .status-badge-ui-disconnected {
   display: none;
 }
 
