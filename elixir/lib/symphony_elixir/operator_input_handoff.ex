@@ -30,9 +30,6 @@ defmodule SymphonyElixir.OperatorInputHandoff do
     else
       {:error, reason} ->
         {:error, reason}
-
-      reason ->
-        {:error, reason}
     end
   end
 
@@ -86,9 +83,10 @@ defmodule SymphonyElixir.OperatorInputHandoff do
 
   def unresolved_blocker?(_issue), do: false
 
-  @spec prompt_context(Path.t(), Issue.t() | nil) :: String.t()
-  def prompt_context(workspace, issue \\ nil)
+  @spec prompt_context(Path.t()) :: String.t()
+  def prompt_context(workspace), do: prompt_context(workspace, nil)
 
+  @spec prompt_context(Path.t(), Issue.t() | nil) :: String.t()
   def prompt_context(workspace, issue) when is_binary(workspace) do
     workspace_candidates(workspace, issue)
     |> Enum.find_value(&prompt_context_from_workspace/1)
@@ -199,15 +197,13 @@ defmodule SymphonyElixir.OperatorInputHandoff do
     configured_root = Config.settings!().workspace.root
     preferred = Map.get(blocked_entry, :workspace_path)
 
-    cond do
-      local_workspace_under_root?(preferred, configured_root) ->
-        {:ok, preferred}
-
-      true ->
-        blocked_entry
-        |> issue_identifier()
-        |> safe_identifier()
-        |> workspace_under_root()
+    if local_workspace_under_root?(preferred, configured_root) do
+      {:ok, preferred}
+    else
+      blocked_entry
+      |> issue_identifier()
+      |> safe_identifier()
+      |> workspace_under_root()
     end
   end
 
@@ -336,8 +332,6 @@ defmodule SymphonyElixir.OperatorInputHandoff do
   defp safe_identifier(identifier) when is_binary(identifier) do
     String.replace(identifier, ~r/[^a-zA-Z0-9._-]/, "_")
   end
-
-  defp safe_identifier(_identifier), do: "issue"
 
   defp datetime_to_iso8601(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
   defp datetime_to_iso8601(_datetime), do: nil
