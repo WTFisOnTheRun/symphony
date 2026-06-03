@@ -543,15 +543,17 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    observed_start_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :normal})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_end_ms = System.monotonic_time(:millisecond)
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, observed_start_ms, observed_end_ms, 500, 1_100)
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -584,14 +586,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    observed_start_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_end_ms = System.monotonic_time(:millisecond)
 
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, observed_start_ms, observed_end_ms, 39_500, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -623,14 +627,16 @@ defmodule SymphonyElixir.CoreTest do
       |> Map.put(:retry_attempts, %{})
     end)
 
+    observed_start_ms = System.monotonic_time(:millisecond)
     send(pid, {:DOWN, ref, :process, self(), :boom})
     Process.sleep(50)
     state = :sys.get_state(pid)
+    observed_end_ms = System.monotonic_time(:millisecond)
 
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, observed_start_ms, observed_end_ms, 9_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -750,11 +756,9 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
-  defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
-    remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
-
-    assert remaining_ms >= min_remaining_ms
-    assert remaining_ms <= max_remaining_ms
+  defp assert_due_in_range(due_at_ms, observed_start_ms, observed_end_ms, min_delay_ms, max_delay_ms) do
+    assert due_at_ms >= observed_start_ms + min_delay_ms
+    assert due_at_ms <= observed_end_ms + max_delay_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
@@ -1003,15 +1007,16 @@ defmodule SymphonyElixir.CoreTest do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
+      git = original_path_executable!("git")
 
       File.mkdir_p!(template_repo)
       File.mkdir_p!(workspace_root)
       File.write!(Path.join(template_repo, "README.md"), "# test")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd(git, ["-C", template_repo, "init", "-b", "main"])
+      System.cmd(git, ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd(git, ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd(git, ["-C", template_repo, "add", "README.md"])
+      System.cmd(git, ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1042,8 +1047,8 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server"
+        hook_after_create: "cp #{bash_command_path(Path.join(template_repo, "README.md"))} README.md",
+        codex_command: "#{bash_command_path(codex_binary)} app-server"
       )
 
       issue = %Issue{
@@ -1087,14 +1092,15 @@ defmodule SymphonyElixir.CoreTest do
       template_repo = Path.join(test_root, "source")
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
+      git = original_path_executable!("git")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd(git, ["-C", template_repo, "init", "-b", "main"])
+      System.cmd(git, ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd(git, ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd(git, ["-C", template_repo, "add", "README.md"])
+      System.cmd(git, ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(
         codex_binary,
@@ -1127,8 +1133,8 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server"
+        hook_after_create: "cp #{bash_command_path(Path.join(template_repo, "README.md"))} README.md",
+        codex_command: "#{bash_command_path(codex_binary)} app-server"
       )
 
       issue = %Issue{
@@ -1181,13 +1187,11 @@ defmodule SymphonyElixir.CoreTest do
 
     try do
       trace_file = Path.join(test_root, "ssh.trace")
-      fake_ssh = Path.join(test_root, "ssh")
 
       File.mkdir_p!(test_root)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
-      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
-      File.write!(fake_ssh, """
+      install_fake_ssh!(test_root, trace_file, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
@@ -1206,8 +1210,6 @@ defmodule SymphonyElixir.CoreTest do
           ;;
       esac
       """)
-
-      File.chmod!(fake_ssh, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: "~/.symphony-remote-workspaces",
@@ -1246,14 +1248,15 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
       trace_file = Path.join(test_root, "codex.trace")
+      git = original_path_executable!("git")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd(git, ["-C", template_repo, "init", "-b", "main"])
+      System.cmd(git, ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd(git, ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd(git, ["-C", template_repo, "add", "README.md"])
+      System.cmd(git, ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1293,8 +1296,8 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
+        hook_after_create: "cp #{bash_command_path(Path.join(template_repo, "README.md"))} README.md",
+        codex_command: "#{bash_command_path(codex_binary)} app-server",
         max_turns: 3
       )
 
@@ -1377,14 +1380,15 @@ defmodule SymphonyElixir.CoreTest do
       workspace_root = Path.join(test_root, "workspaces")
       codex_binary = Path.join(test_root, "fake-codex")
       trace_file = Path.join(test_root, "codex.trace")
+      git = original_path_executable!("git")
 
       File.mkdir_p!(template_repo)
       File.write!(Path.join(template_repo, "README.md"), "# test")
-      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
-      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
-      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
-      System.cmd("git", ["-C", template_repo, "add", "README.md"])
-      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+      System.cmd(git, ["-C", template_repo, "init", "-b", "main"])
+      System.cmd(git, ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd(git, ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd(git, ["-C", template_repo, "add", "README.md"])
+      System.cmd(git, ["-C", template_repo, "commit", "-m", "initial"])
 
       File.write!(codex_binary, """
       #!/bin/sh
@@ -1423,8 +1427,8 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
-        codex_command: "#{codex_binary} app-server",
+        hook_after_create: "cp #{bash_command_path(Path.join(template_repo, "README.md"))} README.md",
+        codex_command: "#{bash_command_path(codex_binary)} app-server",
         max_turns: 2
       )
 
@@ -1522,7 +1526,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server"
+        codex_command: "#{bash_command_path(codex_binary)} app-server"
       )
 
       issue = %Issue{
@@ -1666,7 +1670,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} --config 'model=\"gpt-5.5\"' app-server"
+        codex_command: "#{bash_command_path(codex_binary)} --config 'model=\"gpt-5.5\"' app-server"
       )
 
       issue = %Issue{
@@ -1755,7 +1759,7 @@ defmodule SymphonyElixir.CoreTest do
 
       write_workflow_file!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
-        codex_command: "#{codex_binary} app-server",
+        codex_command: "#{bash_command_path(codex_binary)} app-server",
         codex_approval_policy: "on-request",
         codex_thread_sandbox: "workspace-write",
         codex_turn_sandbox_policy: %{

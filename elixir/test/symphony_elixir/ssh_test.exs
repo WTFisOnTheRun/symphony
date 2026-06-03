@@ -2,6 +2,7 @@ defmodule SymphonyElixir.SSHTest do
   use ExUnit.Case, async: false
 
   alias SymphonyElixir.SSH
+  alias SymphonyElixir.TestSupport
 
   test "run/3 keeps bracketed IPv6 host:port targets intact" do
     test_root = Path.join(System.tmp_dir!(), "symphony-ssh-ipv6-test-#{System.unique_integer([:positive])}")
@@ -13,7 +14,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file)
+    TestSupport.install_fake_ssh!(test_root, trace_file)
 
     assert {:ok, {"", 0}} =
              SSH.run("root@[::1]:2200", "printf ok", stderr_to_stdout: true)
@@ -33,7 +34,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file)
+    TestSupport.install_fake_ssh!(test_root, trace_file)
 
     assert {:ok, {"", 0}} =
              SSH.run("::1:2200", "printf ok", stderr_to_stdout: true)
@@ -55,7 +56,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file)
+    TestSupport.install_fake_ssh!(test_root, trace_file)
     System.put_env("SYMPHONY_SSH_CONFIG", "/tmp/symphony-test-ssh-config")
 
     assert {:ok, {"", 0}} =
@@ -77,7 +78,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file)
+    TestSupport.install_fake_ssh!(test_root, trace_file)
 
     assert {:ok, {"", 0}} =
              SSH.run("root@127.0.0.1:2200", "printf ok", stderr_to_stdout: true)
@@ -114,7 +115,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file, """
+    TestSupport.install_fake_ssh!(test_root, trace_file, """
     #!/bin/sh
     printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
     printf 'ready\\n'
@@ -142,7 +143,7 @@ defmodule SymphonyElixir.SSHTest do
       File.rm_rf(test_root)
     end)
 
-    install_fake_ssh!(test_root, trace_file, """
+    TestSupport.install_fake_ssh!(test_root, trace_file, """
     #!/bin/sh
     printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
     printf 'ready\\n'
@@ -160,26 +161,6 @@ defmodule SymphonyElixir.SSHTest do
   test "remote_shell_command/1 escapes embedded single quotes" do
     assert SSH.remote_shell_command("printf 'hello'") ==
              "bash -lc 'printf '\"'\"'hello'\"'\"''"
-  end
-
-  defp install_fake_ssh!(test_root, trace_file, script \\ nil) do
-    fake_bin_dir = Path.join(test_root, "bin")
-    fake_ssh = Path.join(fake_bin_dir, "ssh")
-
-    File.mkdir_p!(fake_bin_dir)
-
-    File.write!(
-      fake_ssh,
-      script ||
-        """
-        #!/bin/sh
-        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
-        exit 0
-        """
-    )
-
-    File.chmod!(fake_ssh, 0o755)
-    System.put_env("PATH", fake_bin_dir <> ":" <> (System.get_env("PATH") || ""))
   end
 
   defp wait_for_trace!(trace_file, attempts \\ 20)
