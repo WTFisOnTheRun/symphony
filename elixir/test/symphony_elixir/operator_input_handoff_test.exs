@@ -186,24 +186,22 @@ defmodule SymphonyElixir.OperatorInputHandoffTest do
   end
 
   test "symlink escapes are rejected when the platform can create symlinks" do
-    if match?({:win32, _}, :os.type()) do
-      :ok
-    else
-      test_root = unique_test_root("operator-input-symlink")
-      workspace_root = Path.join(test_root, "workspaces")
-      outside_root = Path.join(test_root, "outside")
-      escaped_workspace = Path.join(workspace_root, "MT-ESCAPE")
+    test_root = unique_test_root("operator-input-symlink")
+    workspace_root = Path.join(test_root, "workspaces")
+    outside_root = Path.join(test_root, "outside")
+    escaped_workspace = Path.join(workspace_root, "MT-ESCAPE")
 
+    try do
       File.mkdir_p!(workspace_root)
       File.mkdir_p!(outside_root)
-      File.ln_s!(outside_root, escaped_workspace)
+      create_test_directory_link!(outside_root, escaped_workspace)
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
       issue = %Issue{identifier: "MT-ESCAPE"}
 
       refute OperatorInputHandoff.unresolved_blocker?(issue)
       assert {:error, {:workspace_outside_root, _path}} = OperatorInputHandoff.persist_blocker(%{identifier: "MT-ESCAPE"})
-
+    after
       File.rm_rf(test_root)
     end
   end

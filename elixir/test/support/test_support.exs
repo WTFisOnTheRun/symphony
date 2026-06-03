@@ -1,9 +1,10 @@
 defmodule SymphonyElixir.TestSupport do
   @workflow_prompt "You are an agent for this repository."
+  @original_path System.get_env("PATH") || ""
 
   defmacro __using__(_opts) do
     quote do
-      use ExUnit.Case
+      use ExUnit.Case, async: false
       import ExUnit.CaptureLog
 
       alias SymphonyElixir.AgentRunner
@@ -22,9 +23,27 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0,
+          bash_command_path: 1,
+          bash_original_path_executable!: 1,
+          create_test_directory_link!: 2,
+          install_fake_ssh!: 2,
+          install_fake_ssh!: 3,
+          original_path_executable!: 1,
+          path_separator: 0,
+          prepend_path!: 1,
+          windows?: 0
+        ]
 
       setup do
+        runtime_lock = {SymphonyElixir.TestSupport, :runtime_state}
+        :global.set_lock(runtime_lock, [node()], :infinity)
+        on_exit(fn -> :global.del_lock(runtime_lock, [node()]) end)
+
         workflow_root =
           Path.join(
             System.tmp_dir!(),
@@ -69,6 +88,153 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, nil), do: System.delete_env(key)
   def restore_env(key, value), do: System.put_env(key, value)
 
+  def windows?, do: match?({:win32, _}, :os.type())
+
+  def path_separator do
+    if windows?(), do: ";", else: ":"
+  end
+
+  def prepend_path!(path) when is_binary(path) do
+    System.put_env("PATH", path <> path_separator() <> (System.get_env("PATH") || ""))
+  end
+
+  def ensure_test_shell_path! do
+    if windows?() do
+      case git_bash_bin_path() do
+        nil -> :ok
+        path -> prepend_path!(path)
+      end
+    end
+
+    :ok
+  end
+
+  def bash_command_path(path) when is_binary(path) do
+    expanded = Path.expand(path)
+
+    case Regex.run(~r/^([A-Za-z]):[\\\/](.*)$/, expanded, capture: :all_but_first) do
+      [drive, rest] ->
+        "/" <> String.downcase(drive) <> "/" <> String.replace(rest, "\\", "/")
+
+      _ ->
+        String.replace(expanded, "\\", "/")
+    end
+  end
+
+  def original_path_executable!(name) when is_binary(name) do
+    case original_path_executable(name) do
+      nil -> raise "could not find #{name} on original PATH"
+      executable -> executable
+    end
+  end
+
+  def bash_original_path_executable!(name) when is_binary(name) do
+    name
+    |> original_path_executable!()
+    |> bash_command_path()
+    |> shell_quote()
+  end
+
+  def create_test_directory_link!(target, link) when is_binary(target) and is_binary(link) do
+    case File.ln_s(target, link) do
+      :ok -> :ok
+      {:error, :eperm} -> maybe_create_windows_junction!(target, link)
+      {:error, reason} -> raise "failed to create symlink fixture: #{inspect(reason)}"
+    end
+  end
+
+  def install_fake_ssh!(test_root, trace_file, script \\ nil) do
+    fake_bin_dir = Path.join(test_root, "bin")
+
+    install_fake_ssh_executable!(
+      fake_bin_dir,
+      script ||
+        """
+        #!/bin/sh
+        printf 'ARGV:%s\\n' "$*" >> "#{trace_file}"
+        exit 0
+        """
+    )
+
+    prepend_path!(fake_bin_dir)
+  end
+
+  defp install_fake_ssh_executable!(bin_dir, script) when is_binary(bin_dir) and is_binary(script) do
+    File.mkdir_p!(bin_dir)
+
+    if windows?() do
+      script_path = Path.join(bin_dir, "ssh.sh")
+      launcher_path = Path.join(bin_dir, "ssh.bat")
+
+      File.write!(script_path, normalize_script_newlines(script))
+
+      bash_executable =
+        case git_bash_bin_path() do
+          nil -> "bash"
+          path -> Path.join(path, "bash.exe")
+        end
+
+      File.write!(launcher_path, """
+      @echo off
+      set MSYS2_ARG_CONV_EXCL=*
+      set MSYS_NO_PATHCONV=1
+      "#{bash_executable}" "%~dp0ssh.sh" %*
+      exit /b %ERRORLEVEL%
+      """)
+
+      launcher_path
+    else
+      executable_path = Path.join(bin_dir, "ssh")
+      File.write!(executable_path, normalize_script_newlines(script))
+      File.chmod!(executable_path, 0o755)
+      executable_path
+    end
+  end
+
+  def install_fake_executable!(bin_dir, name, script)
+      when is_binary(bin_dir) and is_binary(name) and is_binary(script) do
+    File.mkdir_p!(bin_dir)
+
+    if windows?() do
+      script_path = Path.join(bin_dir, "#{name}.sh")
+      implementation_path = Path.join(bin_dir, "#{name}.impl.sh")
+      launcher_path = Path.join(bin_dir, "#{name}.bat")
+
+      File.write!(implementation_path, normalize_script_newlines(script))
+
+      File.write!(script_path, """
+      #!/bin/sh
+      if [ "${SYMP_FAKE_ARGV+x}" = "x" ]; then
+        eval "set -- $SYMP_FAKE_ARGV"
+      fi
+
+      . "$(dirname "$0")/#{name}.impl.sh"
+      """)
+
+      bash_executable =
+        case git_bash_bin_path() do
+          nil -> "bash"
+          path -> Path.join(path, "bash.exe")
+        end
+
+      File.write!(launcher_path, """
+      @echo off
+      set MSYS2_ARG_CONV_EXCL=*
+      set MSYS_NO_PATHCONV=1
+      set "SYMP_FAKE_ARGV=%*"
+      "#{bash_executable}" "%~dp0#{name}.sh"
+      exit /b %ERRORLEVEL%
+      """)
+
+      launcher_path
+    else
+      executable_path = Path.join(bin_dir, name)
+      File.write!(executable_path, normalize_script_newlines(script))
+      File.chmod!(executable_path, 0o755)
+      executable_path
+    end
+  end
+
   def stop_default_http_server do
     case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
@@ -86,6 +252,74 @@ defmodule SymphonyElixir.TestSupport do
       _ ->
         :ok
     end
+  end
+
+  defp git_bash_bin_path do
+    [
+      "C:/Program Files/Git/bin",
+      "C:/Program Files/Git/usr/bin",
+      "C:/Program Files (x86)/Git/bin",
+      "C:/Program Files (x86)/Git/usr/bin"
+    ]
+    |> Enum.find(&File.exists?/1)
+  end
+
+  defp original_path_executable(name) do
+    @original_path
+    |> String.split(path_separator(), trim: true)
+    |> Enum.flat_map(fn dir -> Enum.map(executable_names(name), &Path.join(dir, &1)) end)
+    |> Enum.find(&File.exists?/1)
+  end
+
+  defp executable_names(name) do
+    cond do
+      not windows?() ->
+        [name]
+
+      Path.extname(name) != "" ->
+        [name]
+
+      true ->
+        (System.get_env("PATHEXT") || ".COM;.EXE;.BAT;.CMD")
+        |> String.split(";", trim: true)
+        |> Enum.map(&(name <> &1))
+    end
+  end
+
+  defp shell_quote(path) do
+    "'" <> String.replace(path, "'", "'\\''") <> "'"
+  end
+
+  defp create_windows_junction!(target, link) do
+    case System.cmd(
+           "cmd",
+           ["/c", "mklink", "/J", windows_cmd_path(link), windows_cmd_path(target)],
+           stderr_to_stdout: true
+         ) do
+      {_output, 0} ->
+        :ok
+
+      {output, status} ->
+        raise "failed to create junction fixture: status=#{status} output=#{inspect(output)}"
+    end
+  end
+
+  defp maybe_create_windows_junction!(target, link) do
+    if windows?() do
+      create_windows_junction!(target, link)
+    else
+      raise "failed to create symlink fixture: :eperm"
+    end
+  end
+
+  defp windows_cmd_path(path) do
+    path
+    |> Path.expand()
+    |> String.replace("/", "\\")
+  end
+
+  defp normalize_script_newlines(script) when is_binary(script) do
+    String.replace(script, "\r\n", "\n")
   end
 
   defp workflow_content(overrides) do
@@ -207,7 +441,12 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_binary(value) do
-    "\"" <> String.replace(value, "\"", "\\\"") <> "\""
+    escaped =
+      value
+      |> String.replace("\\", "\\\\")
+      |> String.replace("\"", "\\\"")
+
+    "\"" <> escaped <> "\""
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
