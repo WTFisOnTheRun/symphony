@@ -530,11 +530,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "/assets/app.js"
     refute html =~ "<style>"
 
-    dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
+    dashboard_css_conn = get(build_conn(), "/dashboard.css")
+
+    assert Plug.Conn.get_resp_header(dashboard_css_conn, "cache-control") == [
+             "no-cache, max-age=0, must-revalidate"
+           ]
+
+    dashboard_css = response(dashboard_css_conn, 200)
     assert dashboard_css =~ ":root {"
-    assert dashboard_css =~ ".status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
-    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
+    assert dashboard_css =~ ".status-badge-ui-connected"
+    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-ui-connected"
+    assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-ui-disconnected"
 
     phoenix_html_js = response(get(build_conn(), "/vendor/phoenix_html/phoenix_html.js"), 200)
     assert phoenix_html_js =~ "phoenix.link.click"
@@ -574,16 +580,17 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
-    assert html =~ "Live"
-    assert html =~ "Offline"
+    assert html =~ "UI connected"
+    assert html =~ "UI disconnected"
+    refute html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
     refute html =~ "data-runtime-clock="
     refute html =~ "setInterval(refreshRuntimeClocks"
     refute html =~ "Refresh now"
     refute html =~ "Transport"
-    assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
+    assert html =~ "status-badge-ui-connected"
+    assert html =~ "status-badge-ui-disconnected"
 
     updated_snapshot =
       put_in(snapshot.running, [
@@ -675,6 +682,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
+    assert dashboard_css.headers["cache-control"] == ["no-cache, max-age=0, must-revalidate"]
     assert dashboard_css.body =~ ":root {"
 
     phoenix_js = Req.get!("http://127.0.0.1:#{port}/vendor/phoenix/phoenix.js")

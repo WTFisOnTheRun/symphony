@@ -56,13 +56,13 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </div>
 
           <div class="status-stack">
-            <span class="status-badge status-badge-live">
+            <span class="status-badge status-badge-ui-connected">
               <span class="status-badge-dot"></span>
-              Live
+              UI connected
             </span>
-            <span class="status-badge status-badge-offline">
+            <span class="status-badge status-badge-ui-disconnected">
               <span class="status-badge-dot"></span>
-              Offline
+              UI disconnected
             </span>
           </div>
         </div>
