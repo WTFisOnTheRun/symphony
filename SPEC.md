@@ -449,7 +449,7 @@ fields locally if they want stricter startup checks.
 - `turn_timeout_ms` (integer)
   - Default: `3600000` (1 hour)
 - `read_timeout_ms` (integer)
-  - Default: `5000`
+  - Default: `30000`
 - `stall_timeout_ms` (integer)
   - Default: `300000` (5 minutes)
   - If `<= 0`, stall detection is disabled.
@@ -592,7 +592,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`
-- `codex.read_timeout_ms`: integer, default `5000`
+- `codex.read_timeout_ms`: integer, default `30000`
 - `codex.stall_timeout_ms`: integer, default `300000`
 
 ## 7. Orchestration State Machine
