@@ -13,25 +13,33 @@ defmodule SymphonyElixir.ChildRunContract do
     git_mutation: [:git_commit, :git_push, :git_checkout, :git_reset],
     linear_mutation: [:linear_comment, :linear_status, :linear_relationship],
     browser_action: [:browser_click, :browser_type, :browser_navigate],
-    nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent]
+    nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent, :subagent_fork]
   }
   @known_tool_lookup Map.new(
                        @read_only_tools ++
                          (@denied_tool_classes |> Map.values() |> List.flatten()) ++
-                         [:unknown_tool],
+                         [:unknown_tool, :all_tools],
                        &{Atom.to_string(&1), &1}
                      )
   @blocked_parent_keys [
     :messages,
     :conversation,
     :parent_history,
+    :full_history,
     :raw_transcript,
     :transcript,
+    :fork_payload,
+    :fork_request,
+    :fork_style_payload,
     "messages",
     "conversation",
     "parent_history",
+    "full_history",
     "raw_transcript",
-    "transcript"
+    "transcript",
+    "fork_payload",
+    "fork_request",
+    "fork_style_payload"
   ]
   @allowed_child_input_keys [
     :issue_identifier,
@@ -73,7 +81,11 @@ defmodule SymphonyElixir.ChildRunContract do
 
   @spec build(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def build(parent_context, opts \\ []) when is_map(parent_context) do
-    requested_tools = Keyword.get(opts, :requested_tools, @read_only_tools)
+    requested_tools =
+      Keyword.get(opts, :requested_tools) ||
+        requested_tools_from_context(parent_context) ||
+        @read_only_tools
+
     budget_policy = Keyword.get(opts, :budget_policy, default_budget_policy())
     child_input = filter_child_input(parent_context)
     tool_grant = effective_tool_grant(requested_tools)
@@ -225,8 +237,78 @@ defmodule SymphonyElixir.ChildRunContract do
       |> String.replace(~r/[^a-z0-9]+/, "_")
       |> String.trim("_")
 
-    Map.get(@known_tool_lookup, normalized, :unknown_tool)
+    case normalized do
+      wildcard when wildcard in ["", "*", "all", "all_tools", "any", "wildcard"] -> :all_tools
+      _ -> Map.get(@known_tool_lookup, normalized, :unknown_tool)
+    end
   end
+
+  defp normalize_tool(_tool), do: :unknown_tool
+
+  defp requested_tools_from_context(parent_context) do
+    direct_tools =
+      parent_context
+      |> first_present([
+        :allowed_child_tools,
+        "allowed_child_tools",
+        :requested_child_tools,
+        "requested_child_tools",
+        :child_tools,
+        "child_tools",
+        :requested_tools,
+        "requested_tools"
+      ])
+      |> normalize_tool_list()
+
+    ledger_tools =
+      parent_context
+      |> first_present([:effective_tool_grant, "effective_tool_grant", :effective_child_tool_grant, "effective_child_tool_grant"])
+      |> effective_grant_tools()
+
+    case direct_tools ++ ledger_tools do
+      [] -> nil
+      tools -> tools
+    end
+  end
+
+  defp effective_grant_tools(grant) when is_map(grant) do
+    grant
+    |> Map.take([:allowed_tools, "allowed_tools", :denied_tools, "denied_tools", :allowed_child_tools, "allowed_child_tools"])
+    |> Map.values()
+    |> Enum.flat_map(&normalize_tool_list/1)
+  end
+
+  defp effective_grant_tools(_grant), do: []
+
+  defp first_present(map, keys) when is_map(map) do
+    Enum.find_value(keys, fn key ->
+      case Map.fetch(map, key) do
+        {:ok, value} -> value
+        :error -> nil
+      end
+    end)
+  end
+
+  defp normalize_tool_list(nil), do: []
+
+  defp normalize_tool_list(value) when is_list(value) do
+    Enum.flat_map(value, &normalize_tool_list/1)
+  end
+
+  defp normalize_tool_list(value) when is_atom(value), do: [value]
+
+  defp normalize_tool_list(value) when is_binary(value) do
+    value
+    |> String.trim()
+    |> String.trim_leading("[")
+    |> String.trim_trailing("]")
+    |> String.split(~r/[,;\n]/, trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.map(&String.trim(&1, " \"'`"))
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp normalize_tool_list(value), do: [to_string(value)]
 
   defp denied_tool_classes_for(denied_tools) do
     Enum.reduce(@denied_tool_classes, [], fn {class, tools}, classes ->

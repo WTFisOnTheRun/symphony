@@ -28,8 +28,10 @@ defmodule SymphonyElixir.ChildRunTrace do
     }
   end
 
-  @spec valid_run_ledger(map(), term()) :: [map()]
-  def valid_run_ledger(contract, path) do
+  @spec valid_run_ledger(map(), term(), keyword()) :: [map()]
+  def valid_run_ledger(contract, path, opts \\ []) do
+    budget_attrs = budget_attrs(Keyword.get(opts, :budget_context))
+
     [
       event(:child_start, %{
         issue_identifier: contract.child_input.issue_identifier,
@@ -38,9 +40,9 @@ defmodule SymphonyElixir.ChildRunTrace do
       }),
       event(:effective_tool_grant, contract.effective_tool_grant),
       event(:path_check, %{path: path, allowed: true}),
-      event(:budget_threshold, %{state: :ok, used_tokens: 1_000}),
+      event(:budget_threshold, Map.merge(%{state: :ok, used_tokens: 1_000}, budget_attrs)),
       event(:tool_call_attempt, %{tool: :read_file, path: path}),
-      event(:child_terminal_state, %{state: :completed_readonly_proof}),
+      event(:child_terminal_state, %{state: :completed_readonly_proof, decision: :accepted, terminal_blocker: false}),
       event(:parent_synthesis, %{owner: :parent_runner, evidence_author: :parent_runner})
     ]
   end
@@ -48,6 +50,8 @@ defmodule SymphonyElixir.ChildRunTrace do
   @spec denial_ledger(map(), atom() | String.t(), term(), keyword()) :: [map()]
   def denial_ledger(contract, requested_tool, path, opts \\ []) do
     path_allowed = Keyword.get(opts, :path_allowed, false)
+    denial_reason = Keyword.get(opts, :denial_reason, :not_in_effective_read_only_grant)
+    budget_attrs = budget_attrs(Keyword.get(opts, :budget_context))
 
     [
       event(:child_start, %{
@@ -58,16 +62,23 @@ defmodule SymphonyElixir.ChildRunTrace do
       event(:effective_tool_grant, contract.effective_tool_grant),
       event(:path_check, %{path: path, allowed: path_allowed}),
       event(:tool_call_attempt, %{tool: requested_tool, path: path}),
-      event(:tool_denied, %{tool: requested_tool, reason: :not_in_effective_read_only_grant}),
-      event(:budget_threshold, %{state: :warning, used_tokens: 96_000}),
-      event(:child_terminal_state, %{state: :denied_readonly_boundary}),
+      event(:tool_denied, %{tool: requested_tool, reason: denial_reason}),
+      event(:budget_threshold, Map.merge(%{state: :warning, used_tokens: 96_000}, budget_attrs)),
+      event(:child_terminal_state, %{
+        state: :denied_readonly_boundary,
+        decision: :rejected,
+        reason: denial_reason,
+        terminal_blocker: true
+      }),
       event(:parent_synthesis, %{owner: :parent_runner, evidence_author: :parent_runner}),
       event(:stop_close, %{ledger_closed_by: :watchdog, state: :closed_at_stop_timestamp})
     ]
   end
 
-  @spec budget_denial_ledger(map(), term(), integer()) :: [map()]
-  def budget_denial_ledger(contract, path, remaining_warn_fuse_budget) do
+  @spec budget_denial_ledger(map(), term(), map() | integer()) :: [map()]
+  def budget_denial_ledger(contract, path, budget_context) do
+    budget_context = normalize_budget_context(budget_context)
+
     [
       event(:child_start, %{
         issue_identifier: contract.child_input.issue_identifier,
@@ -78,12 +89,19 @@ defmodule SymphonyElixir.ChildRunTrace do
       event(:path_check, %{path: path, allowed: true}),
       event(:budget_threshold, %{
         state: :hard_cap,
-        reason: :parent_synthesis_reserve_breach,
-        remaining_warn_fuse_budget: remaining_warn_fuse_budget,
+        reason: budget_context.denial_reason || :parent_synthesis_reserve_breach,
+        budget_source: budget_context.budget_source,
+        raw_budget_source: budget_context.raw_budget_source,
+        remaining_warn_fuse_budget: budget_context.remaining_warn_fuse_budget,
         child_token_budget: contract.budget_policy.child_token_budget,
         parent_synthesis_reserve_tokens: contract.budget_policy.parent_synthesis_reserve_tokens
       }),
-      event(:child_terminal_state, %{state: :denied_before_execution}),
+      event(:child_terminal_state, %{
+        state: :denied_before_execution,
+        decision: :rejected,
+        reason: budget_context.denial_reason,
+        terminal_blocker: true
+      }),
       event(:parent_synthesis, %{owner: :parent_runner, evidence_author: :parent_runner}),
       event(:stop_close, %{ledger_closed_by: :watchdog, state: :closed_at_stop_timestamp})
     ]
@@ -134,5 +152,44 @@ defmodule SymphonyElixir.ChildRunTrace do
     |> String.replace("\\", "\\\\")
     |> String.replace("\"", "\\\"")
     |> String.replace("\n", "\\n")
+  end
+
+  defp budget_attrs(nil), do: %{}
+
+  defp budget_attrs(%{} = budget_context) do
+    %{
+      budget_source: Map.get(budget_context, :budget_source),
+      raw_budget_source: Map.get(budget_context, :raw_budget_source),
+      remaining_warn_fuse_budget: Map.get(budget_context, :remaining_warn_fuse_budget)
+    }
+  end
+
+  defp budget_attrs(_budget_context), do: %{}
+
+  defp normalize_budget_context(remaining_warn_fuse_budget) when is_integer(remaining_warn_fuse_budget) do
+    %{
+      remaining_warn_fuse_budget: remaining_warn_fuse_budget,
+      budget_source: nil,
+      raw_budget_source: nil,
+      denial_reason: :parent_synthesis_reserve_breach
+    }
+  end
+
+  defp normalize_budget_context(%{} = budget_context) do
+    %{
+      remaining_warn_fuse_budget: Map.get(budget_context, :remaining_warn_fuse_budget),
+      budget_source: Map.get(budget_context, :budget_source),
+      raw_budget_source: Map.get(budget_context, :raw_budget_source),
+      denial_reason: Map.get(budget_context, :denial_reason)
+    }
+  end
+
+  defp normalize_budget_context(_budget_context) do
+    %{
+      remaining_warn_fuse_budget: nil,
+      budget_source: nil,
+      raw_budget_source: nil,
+      denial_reason: nil
+    }
   end
 end
