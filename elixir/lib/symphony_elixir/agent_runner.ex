@@ -90,12 +90,26 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-      try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
-      after
-        AppServer.stop_session(session)
-      end
+    case child_run_pre_turn_gate(issue, opts) do
+      {:allow, child_run_proof} ->
+        opts = Keyword.put(opts, :child_run_dispatcher_proof_result, child_run_proof)
+
+        with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+          try do
+            do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+          after
+            AppServer.stop_session(session)
+          end
+        end
+
+      {:block, proof} ->
+        Logger.warning("Child-run Dispatcher blocked pre-turn for #{issue_context(issue)} proof=#{inspect(terminal_blocker_summary(proof))}")
+        send_child_run_blocked_update(codex_update_recipient, issue, proof)
+        {:error, {:child_run_dispatcher_pre_turn_blocked, terminal_blocker_summary(proof)}}
+
+      {:error, reason} ->
+        Logger.warning("Child-run Dispatcher failed pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
+        {:error, {:child_run_dispatcher_pre_turn_blocked, reason}}
     end
   end
 
@@ -147,6 +161,13 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   @doc false
+  @spec child_run_pre_turn_gate_for_test(Issue.t(), keyword()) ::
+          {:allow, :not_requested | {:ok, map()}} | {:block, map()} | {:error, term()}
+  def child_run_pre_turn_gate_for_test(%Issue{} = issue, opts \\ []) do
+    child_run_pre_turn_gate(issue, opts)
+  end
+
+  @doc false
   @spec child_run_dispatcher_proof_for_test(Issue.t(), keyword()) ::
           :not_requested | {:ok, map()} | {:error, map()} | {:error, term()}
   def child_run_dispatcher_proof_for_test(%Issue{} = issue, opts \\ []) do
@@ -154,7 +175,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp build_turn_prompt(workspace, issue, opts, 1, _max_turns) do
-    child_run_proof = child_run_dispatcher_proof(issue, opts)
+    child_run_proof = child_run_dispatcher_proof_result(issue, opts)
 
     PromptBuilder.build_prompt(issue, opts) <>
       PromptBuilder.child_run_dispatcher_proof_block(child_run_proof) <>
@@ -232,20 +253,36 @@ defmodule SymphonyElixir.AgentRunner do
     if child_run_proof_requested?(description) or Keyword.get(opts, :force_child_run_proof, false) do
       read_path = Keyword.get(opts, :read_path, synthetic_child_run_read_path(issue))
 
-      dispatcher_opts = [
-        capability_request: child_run_capability_request(description, opts),
-        read_path: read_path,
-        requested_tool: Keyword.get(opts, :requested_tool, requested_child_tool(description)),
-        requested_tools: Keyword.get(opts, :requested_tools, requested_child_tools(description)),
-        remaining_warn_fuse_budget:
-          Keyword.get(
-            opts,
-            :remaining_warn_fuse_budget,
-            parsed_integer_field(description, "remaining_warn_fuse_budget") || 520_000
-          ),
-        budget_policy: budget_policy_from_description(description),
-        stage: :runner_control_flow_proof
-      ]
+      budget_field_present? = Keyword.has_key?(opts, :remaining_warn_fuse_budget)
+      parsed_budget = parsed_integer_or_raw_field(description, "remaining_warn_fuse_budget")
+
+      remaining_warn_fuse_budget =
+        if budget_field_present?, do: Keyword.fetch!(opts, :remaining_warn_fuse_budget), else: parsed_budget
+
+      budget_source_field_present? = Keyword.has_key?(opts, :budget_source)
+
+      parsed_budget_source =
+        parsed_budget_source(description, "budget_source") ||
+          parsed_budget_source(description, "remaining_warn_fuse_budget_source")
+
+      budget_source =
+        if budget_source_field_present?, do: Keyword.fetch!(opts, :budget_source), else: parsed_budget_source
+
+      dispatcher_opts =
+        [
+          capability_request: child_run_capability_request(description, opts),
+          read_path: read_path,
+          requested_tool: Keyword.get(opts, :requested_tool, requested_child_tool(description)),
+          requested_tools: Keyword.get(opts, :requested_tools, requested_child_tools(description)),
+          budget_policy: budget_policy_from_description(description),
+          stage: :runner_control_flow_proof
+        ]
+        |> maybe_put_dispatcher_opt(
+          :remaining_warn_fuse_budget,
+          remaining_warn_fuse_budget,
+          budget_field_present? or not is_nil(parsed_budget)
+        )
+        |> maybe_put_dispatcher_opt(:budget_source, budget_source, budget_source_field_present? or not is_nil(parsed_budget_source))
 
       issue
       |> child_run_parent_context(read_path)
@@ -288,7 +325,10 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp requested_child_tools_declared?(description) when is_binary(description) do
-    Regex.match?(~r/(?im)^\s*(requested child tools|child tools|requested_tools)\s*:/, description)
+    Regex.match?(
+      ~r/(?im)^\s*(requested child tools|child tools|requested_tools|allowed_child_tools|effective_tool_grant\.(allowed_tools|denied_tools|allowed_child_tools))\s*:/,
+      description
+    )
   end
 
   defp child_run_capability_request(description, opts) do
@@ -307,15 +347,21 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp requested_child_tools(description) do
-    case Regex.run(~r/(?im)^\s*(?:requested child tools|child tools|requested_tools)\s*:\s*(.+)$/, description) do
-      [_, raw_tools] ->
-        raw_tools
-        |> String.split([",", ";"], trim: true)
-        |> Enum.map(&String.trim/1)
-        |> Enum.reject(&(&1 == ""))
+    tools =
+      description
+      |> parsed_tool_fields([
+        "requested child tools",
+        "child tools",
+        "requested_tools",
+        "allowed_child_tools",
+        "effective_tool_grant.allowed_tools",
+        "effective_tool_grant.denied_tools",
+        "effective_tool_grant.allowed_child_tools"
+      ])
 
-      _ ->
-        ChildRunContract.read_only_tools()
+    case tools do
+      [] -> ChildRunContract.read_only_tools()
+      tools -> tools
     end
   end
 
@@ -335,22 +381,115 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp parsed_integer_field(description, field_name) do
-    pattern = Regex.compile!("(?im)^\\s*#{Regex.escape(field_name)}\\s*:\\s*([0-9_,]+)\\s*$")
+    case parsed_integer_or_raw_field(description, field_name) do
+      value when is_integer(value) -> value
+      _ -> nil
+    end
+  end
 
-    case Regex.run(pattern, description) do
-      [_, raw_value] ->
-        raw_value
-        |> String.replace(~r/[_,]/, "")
-        |> Integer.parse()
-        |> case do
+  defp parsed_integer_or_raw_field(description, field_name) do
+    pattern = Regex.compile!("(?im)^\\s*#{Regex.escape(field_name)}\\s*:\\s*(-?[0-9_,]+|[^\\r\\n]+)\\s*$")
+
+    case Regex.scan(pattern, description, capture: :all_but_first) do
+      matches when matches != [] ->
+        [raw_value] = List.last(matches)
+
+        parsed =
+          raw_value
+          |> String.trim()
+          |> String.replace(~r/[_,]/, "")
+          |> Integer.parse()
+
+        case parsed do
           {value, ""} -> value
-          _ -> nil
+          _ -> String.trim(raw_value)
         end
 
-      _ ->
+      [] ->
         nil
     end
   end
+
+  defp parsed_budget_source(description, field_name) do
+    pattern = Regex.compile!("(?im)^\\s*#{Regex.escape(field_name)}\\s*:\\s*([^\\r\\n]+)\\s*$")
+
+    case Regex.scan(pattern, description, capture: :all_but_first) do
+      matches when matches != [] ->
+        [raw_source] = List.last(matches)
+
+        raw_source
+        |> String.trim()
+        |> String.trim(" \"'`")
+
+      [] ->
+        nil
+    end
+  end
+
+  defp parsed_tool_fields(description, field_names) do
+    field_names
+    |> Enum.flat_map(fn field_name ->
+      pattern = Regex.compile!("(?im)^\\s*#{Regex.escape(field_name)}\\s*:\\s*(.+)$")
+
+      description
+      |> then(&Regex.scan(pattern, &1, capture: :all_but_first))
+      |> Enum.flat_map(fn [raw_tools] -> parse_tool_list(raw_tools) end)
+    end)
+  end
+
+  defp parse_tool_list(raw_tools) do
+    raw_tools
+    |> String.trim()
+    |> String.trim_leading("[")
+    |> String.trim_trailing("]")
+    |> String.split(~r/[,;\n]/, trim: true)
+    |> Enum.map(&String.trim/1)
+    |> Enum.map(&String.trim(&1, " \"'`"))
+    |> Enum.reject(&(&1 == ""))
+  end
+
+  defp child_run_dispatcher_proof_result(%Issue{} = issue, opts) do
+    case Keyword.fetch(opts, :child_run_dispatcher_proof_result) do
+      {:ok, child_run_proof} -> child_run_proof
+      :error -> child_run_dispatcher_proof(issue, opts)
+    end
+  end
+
+  defp child_run_pre_turn_gate(%Issue{} = issue, opts) do
+    case child_run_dispatcher_proof(issue, opts) do
+      {:error, proof} when is_map(proof) -> {:block, proof}
+      {:error, reason} -> {:error, reason}
+      child_run_proof -> {:allow, child_run_proof}
+    end
+  end
+
+  defp send_child_run_blocked_update(recipient, issue, proof) do
+    send_codex_update(recipient, issue, %{
+      event: :child_run_dispatcher_pre_turn_blocked,
+      proof: terminal_blocker_summary(proof),
+      timestamp: DateTime.utc_now()
+    })
+  end
+
+  defp terminal_blocker_summary(proof) when is_map(proof) do
+    Map.take(proof, [
+      :decision,
+      :status,
+      :stage,
+      :denial_reason,
+      :terminal_blocker,
+      :proof_only,
+      :capability_enabled,
+      :spawn_real_child,
+      :budget_source,
+      :remaining_warn_fuse_budget,
+      :effective_tool_grant,
+      :parent_owns_synthesis
+    ])
+  end
+
+  defp maybe_put_dispatcher_opt(opts, _key, _value, false), do: opts
+  defp maybe_put_dispatcher_opt(opts, key, value, true), do: Keyword.put(opts, key, value)
 
   defp child_run_parent_context(%Issue{} = issue, read_path) do
     description = issue.description || ""

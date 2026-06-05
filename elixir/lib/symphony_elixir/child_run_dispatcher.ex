@@ -9,6 +9,8 @@ defmodule SymphonyElixir.ChildRunDispatcher do
   alias SymphonyElixir.ChildRunContract
   alias SymphonyElixir.ChildRunTrace
 
+  @valid_budget_sources [:real_runner_telemetry, :synthetic_fixture]
+
   @spec prepare(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def prepare(parent_context, opts \\ []) when is_map(parent_context) do
     with {:ok, contract} <- ChildRunContract.build(parent_context, opts) do
@@ -32,8 +34,19 @@ defmodule SymphonyElixir.ChildRunDispatcher do
 
     with {:ok, prepared} <- prepare(parent_context, opts) do
       contract = prepared.contract
+      budget_error = runner_budget_error(opts)
+      budget_context = budget_context_from_error(budget_error) || runner_budget_context(opts)
 
       cond do
+        budget_error ->
+          {reason, budget_context} = budget_error
+
+          {:error,
+           proof(:budget_denied, contract, requested_tool, read_path, stage,
+             denial_reason: reason,
+             budget_context: budget_context
+           )}
+
         bare_subagent_fork_request?(Keyword.get(opts, :capability_request)) ->
           {:error,
            denied_proof(
@@ -42,7 +55,8 @@ defmodule SymphonyElixir.ChildRunDispatcher do
              :subagent_fork,
              read_path,
              stage,
-             :bare_subagent_fork_request
+             :bare_subagent_fork_request,
+             budget_context
            )}
 
         denied_tool = first_denied_tool(contract) ->
@@ -53,20 +67,19 @@ defmodule SymphonyElixir.ChildRunDispatcher do
              denied_tool,
              read_path,
              stage,
-             :requested_tool_grant_not_read_only
+             :requested_tool_grant_not_read_only,
+             budget_context
            )}
 
-        reserve_breached?(contract, Keyword.get(opts, :remaining_warn_fuse_budget)) ->
-          remaining_warn_fuse_budget = Keyword.fetch!(opts, :remaining_warn_fuse_budget)
-
+        reserve_breached?(contract, Keyword.fetch!(opts, :remaining_warn_fuse_budget)) ->
           {:error,
            proof(:budget_denied, contract, requested_tool, read_path, stage,
              denial_reason: :parent_synthesis_reserve_breach,
-             remaining_warn_fuse_budget: remaining_warn_fuse_budget
+             budget_context: budget_context
            )}
 
         true ->
-          evaluate_readonly_attempt(contract, requested_tool, read_path, stage)
+          evaluate_readonly_attempt(contract, requested_tool, read_path, stage, runner_budget_context(opts))
       end
     end
   end
@@ -130,51 +143,57 @@ defmodule SymphonyElixir.ChildRunDispatcher do
     })
   end
 
-  defp evaluate_readonly_attempt(contract, requested_tool, read_path, stage) do
+  defp evaluate_readonly_attempt(contract, requested_tool, read_path, stage, budget_context \\ nil) do
     cond do
       not ChildRunContract.path_allowed?(contract, read_path) ->
         reason = :path_not_in_child_read_targets
-        {:error, denied_proof(:path_denied, contract, requested_tool, read_path, stage, reason)}
+        {:error, denied_proof(:path_denied, contract, requested_tool, read_path, stage, reason, budget_context)}
 
       not ChildRunContract.tool_allowed?(contract, requested_tool) ->
         reason = :tool_not_in_effective_read_only_grant
-        {:error, denied_proof(:tool_denied, contract, requested_tool, read_path, stage, reason)}
+        {:error, denied_proof(:tool_denied, contract, requested_tool, read_path, stage, reason, budget_context)}
 
       true ->
-        {:ok, proof(:readonly_allowed, contract, requested_tool, read_path, stage)}
+        {:ok, proof(:readonly_allowed, contract, requested_tool, read_path, stage, budget_context: budget_context)}
     end
   end
 
-  defp proof(status, contract, requested_tool, read_path, stage, opts \\ []) do
-    denied? = status in [:path_denied, :tool_denied, :capability_denied]
+  defp proof(status, contract, requested_tool, read_path, stage, opts) do
+    denied? = status in [:path_denied, :tool_denied, :capability_denied, :budget_denied]
     denial_reason = Keyword.get(opts, :denial_reason)
+    budget_context = Keyword.get(opts, :budget_context)
 
     trace =
       cond do
         status == :budget_denied ->
-          ChildRunTrace.budget_denial_ledger(
-            contract,
-            read_path,
-            Keyword.fetch!(opts, :remaining_warn_fuse_budget)
-          )
+          ChildRunTrace.budget_denial_ledger(contract, read_path, Map.put(budget_context || %{}, :denial_reason, denial_reason))
 
         denied? ->
           path_allowed = ChildRunContract.path_allowed?(contract, read_path)
-          ChildRunTrace.denial_ledger(contract, requested_tool, read_path, path_allowed: path_allowed)
+
+          ChildRunTrace.denial_ledger(contract, requested_tool, read_path,
+            path_allowed: path_allowed,
+            denial_reason: denial_reason,
+            budget_context: budget_context
+          )
 
         true ->
-          ChildRunTrace.valid_run_ledger(contract, read_path)
+          ChildRunTrace.valid_run_ledger(contract, read_path, budget_context: budget_context)
       end
 
     %{
+      decision: decision_for_status(status),
       status: status,
       stage: stage,
       proof_only: true,
       capability_enabled: false,
       spawn_real_child: false,
+      terminal_blocker: terminal_blocker?(status),
       requested_tool: requested_tool,
       read_path: read_path,
       denial_reason: denial_reason,
+      budget_source: budget_source(budget_context),
+      remaining_warn_fuse_budget: remaining_warn_fuse_budget(budget_context),
       child_input_keys: Map.keys(contract.child_input) |> Enum.sort(),
       effective_tool_grant: contract.effective_tool_grant,
       memory_policy: contract.memory_policy,
@@ -183,8 +202,8 @@ defmodule SymphonyElixir.ChildRunDispatcher do
     }
   end
 
-  defp denied_proof(status, contract, requested_tool, read_path, stage, reason) do
-    proof(status, contract, requested_tool, read_path, stage, denial_reason: reason)
+  defp denied_proof(status, contract, requested_tool, read_path, stage, reason, budget_context \\ nil) do
+    proof(status, contract, requested_tool, read_path, stage, denial_reason: reason, budget_context: budget_context)
   end
 
   defp bare_subagent_fork_request?(request)
@@ -200,14 +219,78 @@ defmodule SymphonyElixir.ChildRunDispatcher do
     end
   end
 
-  defp reserve_breached?(_contract, nil), do: false
-
   defp reserve_breached?(contract, remaining_warn_fuse_budget)
        when is_integer(remaining_warn_fuse_budget) do
     not ChildRunContract.parent_reserve_preserved?(contract, remaining_warn_fuse_budget)
   end
 
   defp reserve_breached?(_contract, _remaining_warn_fuse_budget), do: false
+
+  defp runner_budget_error(opts) do
+    cond do
+      not Keyword.has_key?(opts, :remaining_warn_fuse_budget) ->
+        {:missing_remaining_warn_fuse_budget, runner_budget_context(opts)}
+
+      is_nil(Keyword.get(opts, :remaining_warn_fuse_budget)) ->
+        {:nil_remaining_warn_fuse_budget, runner_budget_context(opts)}
+
+      not is_integer(Keyword.get(opts, :remaining_warn_fuse_budget)) ->
+        {:invalid_remaining_warn_fuse_budget, runner_budget_context(opts)}
+
+      Keyword.get(opts, :remaining_warn_fuse_budget) < 0 ->
+        {:negative_remaining_warn_fuse_budget, runner_budget_context(opts)}
+
+      is_nil(normalized_budget_source(Keyword.get(opts, :budget_source))) ->
+        {:missing_or_invalid_budget_source, runner_budget_context(opts)}
+
+      true ->
+        nil
+    end
+  end
+
+  defp runner_budget_context(opts) do
+    %{
+      remaining_warn_fuse_budget: Keyword.get(opts, :remaining_warn_fuse_budget),
+      budget_source: normalized_budget_source(Keyword.get(opts, :budget_source)),
+      raw_budget_source: Keyword.get(opts, :budget_source)
+    }
+  end
+
+  defp budget_context_from_error({_reason, budget_context}), do: budget_context
+  defp budget_context_from_error(_error), do: nil
+
+  defp normalized_budget_source(source) when source in @valid_budget_sources, do: source
+
+  defp normalized_budget_source(source) when is_binary(source) do
+    normalized =
+      source
+      |> String.trim()
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9]+/, "_")
+      |> String.trim("_")
+
+    case normalized do
+      "real_runner_telemetry" -> :real_runner_telemetry
+      "synthetic_fixture" -> :synthetic_fixture
+      _ -> nil
+    end
+  end
+
+  defp normalized_budget_source(_source), do: nil
+
+  defp decision_for_status(:readonly_allowed), do: :accepted
+  defp decision_for_status(_status), do: :rejected
+
+  defp terminal_blocker?(:readonly_allowed), do: false
+  defp terminal_blocker?(_status), do: true
+
+  defp budget_source(nil), do: nil
+  defp budget_source(%{budget_source: budget_source}), do: budget_source
+  defp budget_source(_budget_context), do: nil
+
+  defp remaining_warn_fuse_budget(nil), do: nil
+  defp remaining_warn_fuse_budget(%{remaining_warn_fuse_budget: remaining_warn_fuse_budget}), do: remaining_warn_fuse_budget
+  defp remaining_warn_fuse_budget(_budget_context), do: nil
 
   defp validate_stage1_proof(%{
          status: :readonly_allowed,

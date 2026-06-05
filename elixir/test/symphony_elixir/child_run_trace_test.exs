@@ -70,12 +70,22 @@ defmodule SymphonyElixir.ChildRunTraceTest do
   test "jsonl encoding emits bounded diagnostic events without transcript content" do
     jsonl =
       contract()
-      |> ChildRunTrace.denial_ledger(:write_file, "C:\\unauthorized\\target.txt")
+      |> ChildRunTrace.denial_ledger(:write_file, "C:\\unauthorized\\target.txt",
+        denial_reason: :tool_not_in_effective_read_only_grant,
+        budget_context: %{
+          budget_source: :synthetic_fixture,
+          raw_budget_source: "synthetic_fixture",
+          remaining_warn_fuse_budget: 520_000
+        }
+      )
       |> ChildRunTrace.to_jsonl()
 
     assert String.contains?(jsonl, "\"event\":\"tool_denied\"")
     assert String.contains?(jsonl, "\"event\":\"stop_close\"")
     assert String.contains?(jsonl, "\"proof_only\":true")
+    assert String.contains?(jsonl, "\"terminal_blocker\":true")
+    assert String.contains?(jsonl, "\"budget_source\":\"synthetic_fixture\"")
+    assert String.contains?(jsonl, "\"remaining_warn_fuse_budget\":520000")
     refute String.contains?(jsonl, "raw_transcript")
     refute String.contains?(jsonl, "parent_history")
   end

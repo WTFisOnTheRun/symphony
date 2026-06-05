@@ -19,6 +19,10 @@ defmodule SymphonyElixir.ChildRunDispatcherTest do
     }
   end
 
+  defp runner_budget_opts do
+    [remaining_warn_fuse_budget: 520_000, budget_source: :synthetic_fixture]
+  end
+
   defp with_real_read_fixture(context) do
     path =
       Path.join([
@@ -75,27 +79,48 @@ defmodule SymphonyElixir.ChildRunDispatcherTest do
     end
   end
 
-  test "Runner proof gate treats missing reserve budget as no budget breach" do
-    assert {:ok, proof} =
+  test "Runner proof gate blocks missing reserve budget telemetry" do
+    assert {:error, proof} =
              ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
-               read_path: @synthetic_path,
-               remaining_warn_fuse_budget: nil
+               read_path: @synthetic_path
              )
 
-    assert proof.status == :readonly_allowed
+    assert proof.status == :budget_denied
     assert proof.stage == :runner_control_flow_proof
+    assert proof.denial_reason == :missing_remaining_warn_fuse_budget
+    assert proof.terminal_blocker
     refute proof.spawn_real_child
   end
 
-  test "Runner proof gate ignores non-integer reserve budget input" do
+  test "Runner proof gate blocks nil non-integer negative or unlabeled reserve budget telemetry" do
+    cases = [
+      {[remaining_warn_fuse_budget: nil, budget_source: :synthetic_fixture], :nil_remaining_warn_fuse_budget},
+      {[remaining_warn_fuse_budget: "unknown", budget_source: :synthetic_fixture], :invalid_remaining_warn_fuse_budget},
+      {[remaining_warn_fuse_budget: -1, budget_source: :synthetic_fixture], :negative_remaining_warn_fuse_budget},
+      {[remaining_warn_fuse_budget: 520_000], :missing_or_invalid_budget_source},
+      {[remaining_warn_fuse_budget: 520_000, budget_source: :defaulted], :missing_or_invalid_budget_source}
+    ]
+
+    for {opts, reason} <- cases do
+      assert {:error, proof} =
+               ChildRunDispatcher.execute_runner_proof_gate(parent_context(), [read_path: @synthetic_path] ++ opts)
+
+      assert proof.status == :budget_denied
+      assert proof.denial_reason == reason
+      assert proof.terminal_blocker
+      refute proof.spawn_real_child
+    end
+  end
+
+  test "Runner proof gate accepts explicitly labeled synthetic budget fixture" do
     assert {:ok, proof} =
-             ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
-               read_path: @synthetic_path,
-               remaining_warn_fuse_budget: "unknown"
-             )
+             ChildRunDispatcher.execute_runner_proof_gate(parent_context(), [read_path: @synthetic_path] ++ runner_budget_opts())
 
     assert proof.status == :readonly_allowed
     assert proof.stage == :runner_control_flow_proof
+    assert proof.budget_source == :synthetic_fixture
+    assert proof.remaining_warn_fuse_budget == 520_000
+    refute proof.terminal_blocker
     refute proof.spawn_real_child
   end
 

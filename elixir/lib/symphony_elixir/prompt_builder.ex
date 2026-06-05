@@ -64,8 +64,11 @@ defmodule SymphonyElixir.PromptBuilder do
     - proof_only: #{proof.proof_only}
     - capability_enabled: #{proof.capability_enabled}
     - spawn_real_child: #{proof.spawn_real_child}
+    - terminal_blocker: #{Map.get(proof, :terminal_blocker, decision == :rejected)}
     - parent_owns_synthesis: #{proof.parent_owns_synthesis}
     - requested_tool: #{proof.requested_tool}
+    - budget_source: #{Map.get(proof, :budget_source) || :none}
+    - remaining_warn_fuse_budget: #{Map.get(proof, :remaining_warn_fuse_budget) || :none}
     - child_input_keys: #{Enum.join(proof.child_input_keys, ",")}
     - allowed_tools: #{Enum.join(proof.effective_tool_grant.allowed_tools, ",")}
     - denied_tools: #{Enum.join(denied_tools, ",")}

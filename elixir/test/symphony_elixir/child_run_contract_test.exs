@@ -115,18 +115,39 @@ defmodule SymphonyElixir.ChildRunContractTest do
              git_mutation: [:git_commit, :git_push, :git_checkout, :git_reset],
              linear_mutation: [:linear_comment, :linear_status, :linear_relationship],
              browser_action: [:browser_click, :browser_type, :browser_navigate],
-             nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent]
+             nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent, :subagent_fork]
            }
   end
 
   test "binary tool names normalize without creating arbitrary atoms" do
     {:ok, contract} =
       ChildRunContract.build(@parent_context,
-        requested_tools: ["read-file", "write-file", "unknown-danger"]
+        requested_tools: ["read-file", "write-file", "unknown-danger", "*", "subagent-fork"]
       )
 
     assert contract.effective_tool_grant.allowed_tools == [:read_file]
     assert :write_file in contract.effective_tool_grant.denied_tools
+    assert :unknown_tool in contract.effective_tool_grant.denied_tools
+    assert :all_tools in contract.effective_tool_grant.denied_tools
+    assert :subagent_fork in contract.effective_tool_grant.denied_tools
+    assert :nested_agent in contract.effective_tool_grant.denied_tool_classes
+  end
+
+  test "parses structured allowed_child_tools and effective grant ledger fields" do
+    parent_context =
+      Map.merge(@parent_context, %{
+        "allowed_child_tools" => "read_file, list_dir, write_file",
+        "effective_tool_grant" => %{
+          "allowed_tools" => ["search_text"],
+          "denied_tools" => ["shell", "unknown_danger"]
+        }
+      })
+
+    {:ok, contract} = ChildRunContract.build(parent_context)
+
+    assert contract.effective_tool_grant.allowed_tools == [:read_file, :list_dir, :search_text]
+    assert :write_file in contract.effective_tool_grant.denied_tools
+    assert :shell in contract.effective_tool_grant.denied_tools
     assert :unknown_tool in contract.effective_tool_grant.denied_tools
   end
 
