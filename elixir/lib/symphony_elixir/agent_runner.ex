@@ -5,7 +5,17 @@ defmodule SymphonyElixir.AgentRunner do
 
   require Logger
   alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, OperatorInputHandoff, PromptBuilder, Tracker, Workspace}
+
+  alias SymphonyElixir.{
+    ChildRunContract,
+    ChildRunDispatcher,
+    Config,
+    Linear.Issue,
+    OperatorInputHandoff,
+    PromptBuilder,
+    Tracker,
+    Workspace
+  }
 
   @type worker_host :: String.t() | nil
 
@@ -136,8 +146,19 @@ defmodule SymphonyElixir.AgentRunner do
     build_turn_prompt(workspace, issue, opts, 1, 1)
   end
 
+  @doc false
+  @spec child_run_dispatcher_proof_for_test(Issue.t(), keyword()) ::
+          :not_requested | {:ok, map()} | {:error, map()} | {:error, term()}
+  def child_run_dispatcher_proof_for_test(%Issue{} = issue, opts \\ []) do
+    child_run_dispatcher_proof(issue, opts)
+  end
+
   defp build_turn_prompt(workspace, issue, opts, 1, _max_turns) do
-    PromptBuilder.build_prompt(issue, opts) <> OperatorInputHandoff.prompt_context(workspace, issue)
+    child_run_proof = child_run_dispatcher_proof(issue, opts)
+
+    PromptBuilder.build_prompt(issue, opts) <>
+      PromptBuilder.child_run_dispatcher_proof_block(child_run_proof) <>
+      OperatorInputHandoff.prompt_context(workspace, issue)
   end
 
   defp build_turn_prompt(_workspace, _issue, _opts, turn_number, max_turns) do
@@ -204,6 +225,164 @@ defmodule SymphonyElixir.AgentRunner do
     |> String.trim()
     |> String.downcase()
   end
+
+  defp child_run_dispatcher_proof(%Issue{} = issue, opts) do
+    description = issue.description || ""
+
+    if child_run_proof_requested?(description) or Keyword.get(opts, :force_child_run_proof, false) do
+      read_path = Keyword.get(opts, :read_path, synthetic_child_run_read_path(issue))
+
+      dispatcher_opts = [
+        capability_request: child_run_capability_request(description, opts),
+        read_path: read_path,
+        requested_tool: Keyword.get(opts, :requested_tool, requested_child_tool(description)),
+        requested_tools: Keyword.get(opts, :requested_tools, requested_child_tools(description)),
+        remaining_warn_fuse_budget:
+          Keyword.get(
+            opts,
+            :remaining_warn_fuse_budget,
+            parsed_integer_field(description, "remaining_warn_fuse_budget") || 520_000
+          ),
+        budget_policy: budget_policy_from_description(description),
+        stage: :runner_control_flow_proof
+      ]
+
+      issue
+      |> child_run_parent_context(read_path)
+      |> ChildRunDispatcher.execute_runner_proof_gate(dispatcher_opts)
+    else
+      :not_requested
+    end
+  end
+
+  defp child_run_proof_requested?(description) when is_binary(description) do
+    normalized = String.downcase(description)
+
+    read_only_proof_request? =
+      String.contains?(normalized, "read-only child-run") and
+        String.contains?(normalized, "proof") and
+        (String.contains?(normalized, "dispatcher") or String.contains?(normalized, "proof gate"))
+
+    read_only_proof_request? or bare_subagent_fork_request?(description) or
+      requested_child_tools_declared?(description)
+  end
+
+  defp bare_subagent_fork_request?(description) when is_binary(description) do
+    description
+    |> String.split(~r/\R/, trim: true)
+    |> Enum.any?(fn line ->
+      normalized =
+        line
+        |> String.trim()
+        |> String.downcase()
+
+      bare_bullet? =
+        Regex.match?(~r/^[-*]\s*`?subagent[-_]fork`?\s*(:.*)?$/, normalized) and
+          not (String.contains?(normalized, "read-only") and String.contains?(normalized, "proof"))
+
+      direct_request? =
+        Regex.match?(~r/^requested capability\s*:\s*`?subagent[-_]fork`?\s*$/, normalized)
+
+      bare_bullet? or direct_request?
+    end)
+  end
+
+  defp requested_child_tools_declared?(description) when is_binary(description) do
+    Regex.match?(~r/(?im)^\s*(requested child tools|child tools|requested_tools)\s*:/, description)
+  end
+
+  defp child_run_capability_request(description, opts) do
+    Keyword.get(opts, :capability_request) ||
+      if bare_subagent_fork_request?(description) do
+        :subagent_fork
+      else
+        :subagent_fork_readonly_proof_only
+      end
+  end
+
+  defp requested_child_tool(description) do
+    description
+    |> requested_child_tools()
+    |> List.first(:read_file)
+  end
+
+  defp requested_child_tools(description) do
+    case Regex.run(~r/(?im)^\s*(?:requested child tools|child tools|requested_tools)\s*:\s*(.+)$/, description) do
+      [_, raw_tools] ->
+        raw_tools
+        |> String.split([",", ";"], trim: true)
+        |> Enum.map(&String.trim/1)
+        |> Enum.reject(&(&1 == ""))
+
+      _ ->
+        ChildRunContract.read_only_tools()
+    end
+  end
+
+  defp budget_policy_from_description(description) do
+    ChildRunContract.default_budget_policy()
+    |> maybe_put_integer(:child_token_budget, description)
+    |> maybe_put_integer(:child_output_cap_tokens, description)
+    |> maybe_put_integer(:total_child_pool_max_tokens, description)
+    |> maybe_put_integer(:parent_synthesis_reserve_tokens, description)
+  end
+
+  defp maybe_put_integer(policy, key, description) do
+    case parsed_integer_field(description, Atom.to_string(key)) do
+      value when is_integer(value) -> Map.put(policy, key, value)
+      nil -> policy
+    end
+  end
+
+  defp parsed_integer_field(description, field_name) do
+    pattern = Regex.compile!("(?im)^\\s*#{Regex.escape(field_name)}\\s*:\\s*([0-9_,]+)\\s*$")
+
+    case Regex.run(pattern, description) do
+      [_, raw_value] ->
+        raw_value
+        |> String.replace(~r/[_,]/, "")
+        |> Integer.parse()
+        |> case do
+          {value, ""} -> value
+          _ -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp child_run_parent_context(%Issue{} = issue, read_path) do
+    description = issue.description || ""
+
+    %{
+      issue_identifier: issue.identifier,
+      goal: issue.title || "Runner child-run proof gate",
+      bounded_question: "Return the Dispatcher proof decision for this bounded read-only request.",
+      read_targets: [read_path],
+      source_refs: ["Linear issue #{issue.identifier} Goal Contract"],
+      constraints: [
+        "proof-only",
+        "read-only effective tool grant",
+        "parent runner owns synthesis and Evidence"
+      ],
+      parent_revision: parent_revision(issue),
+      messages: [description],
+      parent_history: description,
+      raw_transcript: "protected diagnostic only"
+    }
+  end
+
+  defp synthetic_child_run_read_path(%Issue{identifier: identifier}) when is_binary(identifier) do
+    "synthetic://#{String.downcase(identifier)}/child-run-dispatcher-proof.md"
+  end
+
+  defp synthetic_child_run_read_path(_issue), do: "synthetic://issue/child-run-dispatcher-proof.md"
+
+  defp parent_revision(%Issue{updated_at: %DateTime{} = updated_at}), do: DateTime.to_iso8601(updated_at)
+  defp parent_revision(%Issue{id: id}) when is_binary(id), do: id
+  defp parent_revision(%Issue{identifier: identifier}) when is_binary(identifier), do: identifier
+  defp parent_revision(_issue), do: "initial"
 
   defp issue_context(%Issue{id: issue_id, identifier: identifier}) do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"

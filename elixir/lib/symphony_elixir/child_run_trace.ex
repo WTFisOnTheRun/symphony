@@ -66,6 +66,29 @@ defmodule SymphonyElixir.ChildRunTrace do
     ]
   end
 
+  @spec budget_denial_ledger(map(), term(), integer()) :: [map()]
+  def budget_denial_ledger(contract, path, remaining_warn_fuse_budget) do
+    [
+      event(:child_start, %{
+        issue_identifier: contract.child_input.issue_identifier,
+        proof_only: contract.proof_only,
+        spawn_real_child: contract.spawn_real_child
+      }),
+      event(:effective_tool_grant, contract.effective_tool_grant),
+      event(:path_check, %{path: path, allowed: true}),
+      event(:budget_threshold, %{
+        state: :hard_cap,
+        reason: :parent_synthesis_reserve_breach,
+        remaining_warn_fuse_budget: remaining_warn_fuse_budget,
+        child_token_budget: contract.budget_policy.child_token_budget,
+        parent_synthesis_reserve_tokens: contract.budget_policy.parent_synthesis_reserve_tokens
+      }),
+      event(:child_terminal_state, %{state: :denied_before_execution}),
+      event(:parent_synthesis, %{owner: :parent_runner, evidence_author: :parent_runner}),
+      event(:stop_close, %{ledger_closed_by: :watchdog, state: :closed_at_stop_timestamp})
+    ]
+  end
+
   @spec covers_required_events?([map()]) :: boolean()
   def covers_required_events?(events) when is_list(events) do
     present =

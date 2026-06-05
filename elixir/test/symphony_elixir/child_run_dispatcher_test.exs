@@ -69,6 +69,36 @@ defmodule SymphonyElixir.ChildRunDispatcherTest do
     end
   end
 
+  test "Runner proof gate requires an explicit read path" do
+    assert_raise KeyError, fn ->
+      ChildRunDispatcher.execute_runner_proof_gate(parent_context())
+    end
+  end
+
+  test "Runner proof gate treats missing reserve budget as no budget breach" do
+    assert {:ok, proof} =
+             ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
+               read_path: @synthetic_path,
+               remaining_warn_fuse_budget: nil
+             )
+
+    assert proof.status == :readonly_allowed
+    assert proof.stage == :runner_control_flow_proof
+    refute proof.spawn_real_child
+  end
+
+  test "Runner proof gate ignores non-integer reserve budget input" do
+    assert {:ok, proof} =
+             ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
+               read_path: @synthetic_path,
+               remaining_warn_fuse_budget: "unknown"
+             )
+
+    assert proof.status == :readonly_allowed
+    assert proof.stage == :runner_control_flow_proof
+    refute proof.spawn_real_child
+  end
+
   test "Stage 1 denies paths outside the filtered child input contract" do
     assert {:error, proof} =
              ChildRunDispatcher.execute_stage1(parent_context(),
