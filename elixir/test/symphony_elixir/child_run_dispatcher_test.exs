@@ -114,7 +114,10 @@ defmodule SymphonyElixir.ChildRunDispatcherTest do
 
   test "Runner proof gate accepts explicitly labeled synthetic budget fixture" do
     assert {:ok, proof} =
-             ChildRunDispatcher.execute_runner_proof_gate(parent_context(), [read_path: @synthetic_path] ++ runner_budget_opts())
+             ChildRunDispatcher.execute_runner_proof_gate(
+               parent_context(),
+               [read_path: @synthetic_path] ++ runner_budget_opts()
+             )
 
     assert proof.status == :readonly_allowed
     assert proof.stage == :runner_control_flow_proof

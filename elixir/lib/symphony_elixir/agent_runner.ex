@@ -96,7 +96,16 @@ defmodule SymphonyElixir.AgentRunner do
 
         with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
           try do
-            do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+            do_run_codex_turns(
+              session,
+              workspace,
+              issue,
+              codex_update_recipient,
+              opts,
+              issue_state_fetcher,
+              1,
+              max_turns
+            )
           after
             AppServer.stop_session(session)
           end
@@ -282,7 +291,11 @@ defmodule SymphonyElixir.AgentRunner do
           remaining_warn_fuse_budget,
           budget_field_present? or not is_nil(parsed_budget)
         )
-        |> maybe_put_dispatcher_opt(:budget_source, budget_source, budget_source_field_present? or not is_nil(parsed_budget_source))
+        |> maybe_put_dispatcher_opt(
+          :budget_source,
+          budget_source,
+          budget_source_field_present? or not is_nil(parsed_budget_source)
+        )
 
       issue
       |> child_run_parent_context(read_path)
