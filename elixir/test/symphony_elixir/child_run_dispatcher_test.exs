@@ -127,6 +127,33 @@ defmodule SymphonyElixir.ChildRunDispatcherTest do
     refute proof.spawn_real_child
   end
 
+  test "Runner proof gate accepts real telemetry budget source labels" do
+    assert {:ok, proof} =
+             ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
+               read_path: @synthetic_path,
+               remaining_warn_fuse_budget: 520_000,
+               budget_source: "real runner telemetry"
+             )
+
+    assert proof.status == :readonly_allowed
+    assert proof.budget_source == :real_runner_telemetry
+    assert proof.remaining_warn_fuse_budget == 520_000
+  end
+
+  test "Runner proof gate rejects unknown string budget source labels" do
+    assert {:error, proof} =
+             ChildRunDispatcher.execute_runner_proof_gate(parent_context(),
+               read_path: @synthetic_path,
+               remaining_warn_fuse_budget: 520_000,
+               budget_source: "defaulted"
+             )
+
+    assert proof.status == :budget_denied
+    assert proof.denial_reason == :missing_or_invalid_budget_source
+    assert proof.budget_source == nil
+    assert proof.terminal_blocker
+  end
+
   test "Stage 1 denies paths outside the filtered child input contract" do
     assert {:error, proof} =
              ChildRunDispatcher.execute_stage1(parent_context(),

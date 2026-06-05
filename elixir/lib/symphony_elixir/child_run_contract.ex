@@ -243,6 +243,8 @@ defmodule SymphonyElixir.ChildRunContract do
     end
   end
 
+  defp normalize_tool(_tool), do: :unknown_tool
+
   defp requested_tools_from_context(parent_context) do
     direct_tools =
       parent_context

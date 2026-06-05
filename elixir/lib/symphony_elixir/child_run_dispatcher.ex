@@ -224,8 +224,6 @@ defmodule SymphonyElixir.ChildRunDispatcher do
     not ChildRunContract.parent_reserve_preserved?(contract, remaining_warn_fuse_budget)
   end
 
-  defp reserve_breached?(_contract, _remaining_warn_fuse_budget), do: false
-
   defp runner_budget_error(opts) do
     cond do
       not Keyword.has_key?(opts, :remaining_warn_fuse_budget) ->
@@ -286,11 +284,9 @@ defmodule SymphonyElixir.ChildRunDispatcher do
 
   defp budget_source(nil), do: nil
   defp budget_source(%{budget_source: budget_source}), do: budget_source
-  defp budget_source(_budget_context), do: nil
 
   defp remaining_warn_fuse_budget(nil), do: nil
   defp remaining_warn_fuse_budget(%{remaining_warn_fuse_budget: remaining_warn_fuse_budget}), do: remaining_warn_fuse_budget
-  defp remaining_warn_fuse_budget(_budget_context), do: nil
 
   defp validate_stage1_proof(%{
          status: :readonly_allowed,

@@ -133,6 +133,32 @@ defmodule SymphonyElixir.ChildRunContractTest do
     assert :nested_agent in contract.effective_tool_grant.denied_tool_classes
   end
 
+  test "atom and non-string tool declarations normalize through the same grant policy" do
+    {:ok, contract} =
+      ChildRunContract.build(@parent_context,
+        requested_tools: [:read_file, :shell, 123]
+      )
+
+    assert contract.effective_tool_grant.allowed_tools == [:read_file]
+    assert :shell in contract.effective_tool_grant.denied_tools
+    assert :unknown_tool in contract.effective_tool_grant.denied_tools
+  end
+
+  test "structured context tool declarations normalize atom and non-string values" do
+    parent_context =
+      Map.merge(@parent_context, %{
+        allowed_child_tools: :read_file,
+        effective_tool_grant: %{
+          denied_tools: 123
+        }
+      })
+
+    {:ok, contract} = ChildRunContract.build(parent_context)
+
+    assert contract.effective_tool_grant.allowed_tools == [:read_file]
+    assert :unknown_tool in contract.effective_tool_grant.denied_tools
+  end
+
   test "parses structured allowed_child_tools and effective grant ledger fields" do
     parent_context =
       Map.merge(@parent_context, %{

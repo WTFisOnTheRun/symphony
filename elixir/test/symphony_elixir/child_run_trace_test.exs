@@ -114,4 +114,32 @@ defmodule SymphonyElixir.ChildRunTraceTest do
     assert String.contains?(jsonl, "\"list_value\":[\"read_file\",\"plain\",3]")
     assert String.contains?(jsonl, "quoted \\\"value\\\" with slash \\\\ and newline\\n")
   end
+
+  test "budget fields tolerate raw reserve values and malformed budget context" do
+    integer_budget_event =
+      contract()
+      |> ChildRunTrace.budget_denial_ledger(@path, 500_000)
+      |> Enum.find(&(&1.event == :budget_threshold))
+
+    assert integer_budget_event.attrs.remaining_warn_fuse_budget == 500_000
+    assert integer_budget_event.attrs.reason == :parent_synthesis_reserve_breach
+    assert integer_budget_event.attrs.budget_source == nil
+
+    malformed_budget_event =
+      contract()
+      |> ChildRunTrace.budget_denial_ledger(@path, :unknown)
+      |> Enum.find(&(&1.event == :budget_threshold))
+
+    assert malformed_budget_event.attrs.remaining_warn_fuse_budget == nil
+    assert malformed_budget_event.attrs.reason == :parent_synthesis_reserve_breach
+    assert malformed_budget_event.attrs.budget_source == nil
+
+    valid_event =
+      contract()
+      |> ChildRunTrace.valid_run_ledger(@path, budget_context: :unknown)
+      |> Enum.find(&(&1.event == :budget_threshold))
+
+    refute Map.has_key?(valid_event.attrs, :remaining_warn_fuse_budget)
+    refute Map.has_key?(valid_event.attrs, :budget_source)
+  end
 end

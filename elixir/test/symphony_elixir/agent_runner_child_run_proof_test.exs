@@ -122,6 +122,27 @@ defmodule SymphonyElixir.AgentRunnerChildRunProofTest do
     refute proof.spawn_real_child
   end
 
+  test "PromptBuilder renders rejected Dispatcher proof maps" do
+    description = """
+    ## Required Capabilities
+
+    remaining_warn_fuse_budget: 520000
+    budget_source: synthetic_fixture
+
+    - subagent-fork
+    """
+
+    assert {:error, proof} = AgentRunner.child_run_dispatcher_proof_for_test(issue(description))
+
+    block = PromptBuilder.child_run_dispatcher_proof_block({:error, proof})
+
+    assert block =~ "- decision: rejected"
+    assert block =~ "- status: capability_denied"
+    assert block =~ "- terminal_blocker: true"
+    assert block =~ "- budget_source: synthetic_fixture"
+    assert block =~ "- remaining_warn_fuse_budget: 520000"
+  end
+
   test "PromptBuilder renders generic Dispatcher proof errors" do
     block = PromptBuilder.child_run_dispatcher_proof_block({:error, :contract_failed})
 
