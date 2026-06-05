@@ -1,9 +1,9 @@
 defmodule SymphonyElixir.ChildRunDispatcher do
   @moduledoc """
-  Disabled/proof-only dispatcher skeleton for DTS-39.
+  Proof-only dispatcher for read-only child-run slices.
 
-  It proves contract mechanics and trace output. It does not spawn agents, grant
-  runtime capability, mutate files, or enter the live runner dispatch path.
+  Runner control flow may route bounded proof checks through it. It does not spawn agents, grant runtime
+  capability, mutate files, or perform live child dispatch.
   """
 
   alias SymphonyElixir.ChildRunContract
@@ -21,6 +21,53 @@ defmodule SymphonyElixir.ChildRunDispatcher do
          memory_policy: contract.memory_policy,
          spawn_real_child: false
        }}
+    end
+  end
+
+  @spec execute_runner_proof_gate(map(), keyword()) :: {:ok, map()} | {:error, map()} | {:error, term()}
+  def execute_runner_proof_gate(parent_context, opts \\ []) when is_map(parent_context) do
+    requested_tool = Keyword.get(opts, :requested_tool, :read_file)
+    read_path = Keyword.fetch!(opts, :read_path)
+    stage = Keyword.get(opts, :stage, :runner_control_flow_proof)
+
+    with {:ok, prepared} <- prepare(parent_context, opts) do
+      contract = prepared.contract
+
+      cond do
+        bare_subagent_fork_request?(Keyword.get(opts, :capability_request)) ->
+          {:error,
+           denied_proof(
+             :capability_denied,
+             contract,
+             :subagent_fork,
+             read_path,
+             stage,
+             :bare_subagent_fork_request
+           )}
+
+        denied_tool = first_denied_tool(contract) ->
+          {:error,
+           denied_proof(
+             :tool_denied,
+             contract,
+             denied_tool,
+             read_path,
+             stage,
+             :requested_tool_grant_not_read_only
+           )}
+
+        reserve_breached?(contract, Keyword.get(opts, :remaining_warn_fuse_budget)) ->
+          remaining_warn_fuse_budget = Keyword.fetch!(opts, :remaining_warn_fuse_budget)
+
+          {:error,
+           proof(:budget_denied, contract, requested_tool, read_path, stage,
+             denial_reason: :parent_synthesis_reserve_breach,
+             remaining_warn_fuse_budget: remaining_warn_fuse_budget
+           )}
+
+        true ->
+          evaluate_readonly_attempt(contract, requested_tool, read_path, stage)
+      end
     end
   end
 
@@ -99,15 +146,24 @@ defmodule SymphonyElixir.ChildRunDispatcher do
   end
 
   defp proof(status, contract, requested_tool, read_path, stage, opts \\ []) do
-    denied? = status in [:path_denied, :tool_denied]
+    denied? = status in [:path_denied, :tool_denied, :capability_denied]
     denial_reason = Keyword.get(opts, :denial_reason)
 
     trace =
-      if denied? do
-        path_allowed = ChildRunContract.path_allowed?(contract, read_path)
-        ChildRunTrace.denial_ledger(contract, requested_tool, read_path, path_allowed: path_allowed)
-      else
-        ChildRunTrace.valid_run_ledger(contract, read_path)
+      cond do
+        status == :budget_denied ->
+          ChildRunTrace.budget_denial_ledger(
+            contract,
+            read_path,
+            Keyword.fetch!(opts, :remaining_warn_fuse_budget)
+          )
+
+        denied? ->
+          path_allowed = ChildRunContract.path_allowed?(contract, read_path)
+          ChildRunTrace.denial_ledger(contract, requested_tool, read_path, path_allowed: path_allowed)
+
+        true ->
+          ChildRunTrace.valid_run_ledger(contract, read_path)
       end
 
     %{
@@ -130,6 +186,28 @@ defmodule SymphonyElixir.ChildRunDispatcher do
   defp denied_proof(status, contract, requested_tool, read_path, stage, reason) do
     proof(status, contract, requested_tool, read_path, stage, denial_reason: reason)
   end
+
+  defp bare_subagent_fork_request?(request)
+       when request in [:subagent_fork, :subagent_fork_unscoped, "subagent-fork", "subagent_fork"],
+       do: true
+
+  defp bare_subagent_fork_request?(_request), do: false
+
+  defp first_denied_tool(contract) do
+    case get_in(contract, [:effective_tool_grant, :denied_tools]) do
+      [denied_tool | _] -> denied_tool
+      _ -> nil
+    end
+  end
+
+  defp reserve_breached?(_contract, nil), do: false
+
+  defp reserve_breached?(contract, remaining_warn_fuse_budget)
+       when is_integer(remaining_warn_fuse_budget) do
+    not ChildRunContract.parent_reserve_preserved?(contract, remaining_warn_fuse_budget)
+  end
+
+  defp reserve_breached?(_contract, _remaining_warn_fuse_budget), do: false
 
   defp validate_stage1_proof(%{
          status: :readonly_allowed,

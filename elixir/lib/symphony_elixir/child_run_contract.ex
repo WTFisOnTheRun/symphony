@@ -1,9 +1,9 @@
 defmodule SymphonyElixir.ChildRunContract do
   @moduledoc """
-  Proof-only contract for the DTS-39 read-only child-run slice.
+  Proof-only contract for read-only child-run slices.
 
   This module models the runner control-plane contract without enabling
-  subagent-fork, spawning a child process, or changing runner dispatch.
+  write-capable subagent-fork, spawning a child process, or live child dispatch.
   """
 
   @read_only_tools [:read_file, :list_dir, :search_text]
