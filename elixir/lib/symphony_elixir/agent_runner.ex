@@ -339,7 +339,7 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp requested_child_tools_declared?(description) when is_binary(description) do
     Regex.match?(
-      ~r/(?im)^\s*(requested child tools|child tools|requested_tools|allowed_child_tools|effective_tool_grant\.(allowed_tools|denied_tools|allowed_child_tools))\s*:/,
+      ~r/(?im)^\s*(requested child tools|child tools|requested_tools|allowed_child_tools|effective_tool_grant|effective_child_tool_grant|effective_tool_grant\.(allowed_tools|denied_tools|allowed_child_tools))\s*:/,
       description
     )
   end
@@ -360,7 +360,7 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp requested_child_tools(description) do
-    tools =
+    flat_tools =
       description
       |> parsed_tool_fields([
         "requested child tools",
@@ -371,6 +371,8 @@ defmodule SymphonyElixir.AgentRunner do
         "effective_tool_grant.denied_tools",
         "effective_tool_grant.allowed_child_tools"
       ])
+
+    tools = flat_tools ++ parsed_nested_tool_grant_fields(description)
 
     case tools do
       [] -> ChildRunContract.read_only_tools()
@@ -448,6 +450,24 @@ defmodule SymphonyElixir.AgentRunner do
       |> then(&Regex.scan(pattern, &1, capture: :all_but_first))
       |> Enum.flat_map(fn [raw_tools] -> parse_tool_list(raw_tools) end)
     end)
+  end
+
+  defp parsed_nested_tool_grant_fields(description) do
+    description
+    |> nested_tool_grant_blocks()
+    |> Enum.flat_map(fn block ->
+      Regex.scan(~r/(?im)^\s*(allowed_tools|denied_tools|allowed_child_tools)\s*:\s*(.+)$/, block, capture: :all_but_first)
+    end)
+    |> Enum.flat_map(fn [_field_name, raw_tools] -> parse_tool_list(raw_tools) end)
+  end
+
+  defp nested_tool_grant_blocks(description) do
+    Regex.scan(
+      ~r/(?ims)^\s*(?:effective_tool_grant|effective_child_tool_grant)\s*:\s*((?:\R[ \t]+[a-zA-Z0-9_.-]+\s*:\s*[^\r\n]+)+)/,
+      description,
+      capture: :all_but_first
+    )
+    |> Enum.map(fn [block] -> block end)
   end
 
   defp parse_tool_list(raw_tools) do

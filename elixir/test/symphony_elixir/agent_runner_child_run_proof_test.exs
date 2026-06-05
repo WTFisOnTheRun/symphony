@@ -143,6 +143,26 @@ defmodule SymphonyElixir.AgentRunnerChildRunProofTest do
     assert block =~ "- remaining_warn_fuse_budget: 520000"
   end
 
+  test "nested effective tool grant declarations reject denied child tools before turn launch" do
+    description = """
+    ## Required Capabilities
+
+    remaining_warn_fuse_budget: 520000
+    budget_source: synthetic_fixture
+
+    effective_tool_grant:
+      allowed_tools: read_file, list_dir
+      denied_tools: shell
+    """
+
+    assert {:error, proof} = AgentRunner.child_run_dispatcher_proof_for_test(issue(description))
+    assert proof.status == :tool_denied
+    assert proof.denial_reason == :requested_tool_grant_not_read_only
+    assert proof.terminal_blocker
+    assert :shell in proof.effective_tool_grant.denied_tools
+    refute proof.spawn_real_child
+  end
+
   test "PromptBuilder renders generic Dispatcher proof errors" do
     block = PromptBuilder.child_run_dispatcher_proof_block({:error, :contract_failed})
 
