@@ -37,6 +37,42 @@ defmodule SymphonyElixir.AgentRunnerCodexGoalTest do
              AgentRunner.codex_thread_goal_contract_for_test(issue("## Goal\n\nRun the normal ticket workflow."))
   end
 
+  test "Codex Thread Goal contract headings must be level two" do
+    nested_goal_description = """
+    ## Goal
+
+    Keep the parent Runner oriented.
+
+    ## Required Capabilities
+
+    - `codex-thread-goal-bridge`: set the parent Codex thread goal.
+
+    ### Codex Thread Goal
+
+    objective: Keep the DTS-48 Codex session focused.
+    """
+
+    assert {:ok, :not_requested} =
+             AgentRunner.codex_thread_goal_contract_for_test(issue(nested_goal_description))
+
+    nested_capability_description = """
+    ## Goal
+
+    Keep the parent Runner oriented.
+
+    ### Required Capabilities
+
+    - `codex-thread-goal-bridge`: set the parent Codex thread goal.
+
+    ## Codex Thread Goal
+
+    objective: Keep the DTS-48 Codex session focused.
+    """
+
+    assert {:error, {:missing_codex_thread_goal_capability_request, "codex-thread-goal-bridge"}} =
+             AgentRunner.codex_thread_goal_contract_for_test(issue(nested_capability_description))
+  end
+
   test "Codex Thread Goal sections require an explicit capability request" do
     description = """
     ## Goal

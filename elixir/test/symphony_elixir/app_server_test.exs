@@ -146,6 +146,12 @@ defmodule SymphonyElixir.AppServerTest do
       assert {:ok, session} = AppServer.start_session(workspace)
 
       try do
+        assert {:error, {:invalid_thread_goal_token_budget, 0}} =
+                 AppServer.set_goal(session, "Reject invalid zero budget", token_budget: 0)
+
+        assert {:error, {:invalid_thread_goal_token_budget, "eventually"}} =
+                 AppServer.set_goal(session, "Reject invalid text budget", token_budget: "eventually")
+
         assert {:ok, goal} = AppServer.set_goal(session, " Keep DTS-48 oriented ", token_budget: 120_000)
         assert goal["threadId"] == "thread-goal"
         assert goal["objective"] == "Keep DTS-48 oriented"
@@ -167,7 +173,10 @@ defmodule SymphonyElixir.AppServerTest do
         |> Enum.filter(&String.starts_with?(&1, "JSON:"))
         |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
 
-      goal_set_payload = Enum.find(payloads, &(&1["method"] == "thread/goal/set"))
+      goal_set_payloads = Enum.filter(payloads, &(&1["method"] == "thread/goal/set"))
+      assert length(goal_set_payloads) == 1
+
+      goal_set_payload = List.first(goal_set_payloads)
       assert get_in(goal_set_payload, ["params", "threadId"]) == "thread-goal"
       assert get_in(goal_set_payload, ["params", "objective"]) == "Keep DTS-48 oriented"
       assert get_in(goal_set_payload, ["params", "status"]) == "active"

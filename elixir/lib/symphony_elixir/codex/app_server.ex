@@ -151,31 +151,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec set_goal(session(), String.t(), keyword()) :: {:ok, thread_goal()} | {:error, term()}
   def set_goal(%{port: port, thread_id: thread_id}, objective, opts \\ [])
       when is_port(port) and is_binary(thread_id) and is_binary(objective) do
-    case normalize_goal_objective(objective) do
-      {:ok, normalized_objective} ->
-        payload =
-          %{
-            "method" => "thread/goal/set",
-            "id" => @thread_goal_set_id,
-            "params" =>
-              %{
-                "threadId" => thread_id,
-                "objective" => normalized_objective,
-                "status" => Keyword.get(opts, :status, "active")
-              }
-              |> maybe_put_token_budget(Keyword.get(opts, :token_budget))
-          }
-
-        send_message(port, payload)
-
-        case await_response(port, @thread_goal_set_id) do
-          {:ok, %{"goal" => goal}} when is_map(goal) -> {:ok, goal}
-          {:ok, response} -> {:error, {:invalid_thread_goal_set_response, response}}
-          other -> other
-        end
-
-      {:error, reason} ->
-        {:error, reason}
+    with {:ok, normalized_objective} <- normalize_goal_objective(objective),
+         {:ok, params} <- thread_goal_set_params(thread_id, normalized_objective, opts) do
+      send_thread_goal_set(port, params)
     end
   end
 
@@ -1103,13 +1081,40 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp maybe_put_token_budget(params, nil), do: params
-
-  defp maybe_put_token_budget(params, token_budget) when is_integer(token_budget) and token_budget > 0 do
-    Map.put(params, "tokenBudget", token_budget)
+  defp thread_goal_set_params(thread_id, objective, opts) do
+    %{
+      "threadId" => thread_id,
+      "objective" => objective,
+      "status" => Keyword.get(opts, :status, "active")
+    }
+    |> maybe_put_token_budget(Keyword.get(opts, :token_budget))
   end
 
-  defp maybe_put_token_budget(params, token_budget), do: Map.put(params, "tokenBudget", token_budget)
+  defp send_thread_goal_set(port, params) do
+    payload = %{
+      "method" => "thread/goal/set",
+      "id" => @thread_goal_set_id,
+      "params" => params
+    }
+
+    send_message(port, payload)
+
+    case await_response(port, @thread_goal_set_id) do
+      {:ok, %{"goal" => goal}} when is_map(goal) -> {:ok, goal}
+      {:ok, response} -> {:error, {:invalid_thread_goal_set_response, response}}
+      other -> other
+    end
+  end
+
+  defp maybe_put_token_budget(params, nil), do: {:ok, params}
+
+  defp maybe_put_token_budget(params, token_budget) when is_integer(token_budget) and token_budget > 0 do
+    {:ok, Map.put(params, "tokenBudget", token_budget)}
+  end
+
+  defp maybe_put_token_budget(_params, token_budget) do
+    {:error, {:invalid_thread_goal_token_budget, token_budget}}
+  end
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

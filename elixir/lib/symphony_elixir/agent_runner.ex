@@ -416,11 +416,13 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp markdown_section_start_match(index, level, title, section_title) do
+  defp markdown_section_start_match(index, 2 = level, title, section_title) do
     if normalize_markdown_heading_title(title) == normalize_markdown_heading_title(section_title) do
       {index, level}
     end
   end
+
+  defp markdown_section_start_match(_index, _level, _title, _section_title), do: nil
 
   defp markdown_section_body(lines, index, heading_level) when is_list(lines) do
     lines
