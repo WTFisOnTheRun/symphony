@@ -9,6 +9,9 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_goal_set_id 4
+  @thread_goal_get_id 5
+  @thread_goal_clear_id 6
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -24,6 +27,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           workspace: Path.t(),
           worker_host: String.t() | nil
         }
+  @type thread_goal :: map()
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
@@ -142,6 +146,71 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
+  end
+
+  @spec set_goal(session(), String.t(), keyword()) :: {:ok, thread_goal()} | {:error, term()}
+  def set_goal(%{port: port, thread_id: thread_id}, objective, opts \\ [])
+      when is_port(port) and is_binary(thread_id) and is_binary(objective) do
+    case normalize_goal_objective(objective) do
+      {:ok, normalized_objective} ->
+        payload =
+          %{
+            "method" => "thread/goal/set",
+            "id" => @thread_goal_set_id,
+            "params" =>
+              %{
+                "threadId" => thread_id,
+                "objective" => normalized_objective,
+                "status" => Keyword.get(opts, :status, "active")
+              }
+              |> maybe_put_token_budget(Keyword.get(opts, :token_budget))
+          }
+
+        send_message(port, payload)
+
+        case await_response(port, @thread_goal_set_id) do
+          {:ok, %{"goal" => goal}} when is_map(goal) -> {:ok, goal}
+          {:ok, response} -> {:error, {:invalid_thread_goal_set_response, response}}
+          other -> other
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @spec get_goal(session()) :: {:ok, thread_goal() | nil} | {:error, term()}
+  def get_goal(%{port: port, thread_id: thread_id}) when is_port(port) and is_binary(thread_id) do
+    send_message(port, %{
+      "method" => "thread/goal/get",
+      "id" => @thread_goal_get_id,
+      "params" => %{
+        "threadId" => thread_id
+      }
+    })
+
+    case await_response(port, @thread_goal_get_id) do
+      {:ok, %{"goal" => goal}} when is_map(goal) or is_nil(goal) -> {:ok, goal}
+      {:ok, response} -> {:error, {:invalid_thread_goal_get_response, response}}
+      other -> other
+    end
+  end
+
+  @spec clear_goal(session()) :: {:ok, boolean()} | {:error, term()}
+  def clear_goal(%{port: port, thread_id: thread_id}) when is_port(port) and is_binary(thread_id) do
+    send_message(port, %{
+      "method" => "thread/goal/clear",
+      "id" => @thread_goal_clear_id,
+      "params" => %{
+        "threadId" => thread_id
+      }
+    })
+
+    case await_response(port, @thread_goal_clear_id) do
+      {:ok, %{"cleared" => cleared}} when is_boolean(cleared) -> {:ok, cleared}
+      {:ok, response} -> {:error, {:invalid_thread_goal_clear_response, response}}
+      other -> other
+    end
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -1026,6 +1095,21 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp normalize_goal_objective(objective) when is_binary(objective) do
+    case String.trim(objective) do
+      "" -> {:error, :empty_thread_goal_objective}
+      trimmed -> {:ok, trimmed}
+    end
+  end
+
+  defp maybe_put_token_budget(params, nil), do: params
+
+  defp maybe_put_token_budget(params, token_budget) when is_integer(token_budget) and token_budget > 0 do
+    Map.put(params, "tokenBudget", token_budget)
+  end
+
+  defp maybe_put_token_budget(params, token_budget), do: Map.put(params, "tokenBudget", token_budget)
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

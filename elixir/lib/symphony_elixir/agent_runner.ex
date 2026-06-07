@@ -18,6 +18,7 @@ defmodule SymphonyElixir.AgentRunner do
   }
 
   @type worker_host :: String.t() | nil
+  @codex_thread_goal_capability_id "codex-thread-goal-bridge"
 
   @spec run(map(), pid() | nil, keyword()) :: :ok | no_return()
   def run(issue, codex_update_recipient \\ nil, opts \\ []) do
@@ -90,35 +91,45 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
-    case child_run_pre_turn_gate(issue, opts) do
-      {:allow, child_run_proof} ->
-        opts = Keyword.put(opts, :child_run_dispatcher_proof_result, child_run_proof)
+    case codex_thread_goal_contract(issue) do
+      {:ok, codex_thread_goal} ->
+        case child_run_pre_turn_gate(issue, opts) do
+          {:allow, child_run_proof} ->
+            opts = Keyword.put(opts, :child_run_dispatcher_proof_result, child_run_proof)
 
-        with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-          try do
-            do_run_codex_turns(
-              session,
-              workspace,
-              issue,
-              codex_update_recipient,
-              opts,
-              issue_state_fetcher,
-              1,
-              max_turns
-            )
-          after
-            AppServer.stop_session(session)
-          end
+            with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+              try do
+                with :ok <- maybe_set_codex_thread_goal(session, issue, codex_thread_goal, codex_update_recipient) do
+                  do_run_codex_turns(
+                    session,
+                    workspace,
+                    issue,
+                    codex_update_recipient,
+                    opts,
+                    issue_state_fetcher,
+                    1,
+                    max_turns
+                  )
+                end
+              after
+                AppServer.stop_session(session)
+              end
+            end
+
+          {:block, proof} ->
+            Logger.warning("Child-run Dispatcher blocked pre-turn for #{issue_context(issue)} proof=#{inspect(terminal_blocker_summary(proof))}")
+            send_child_run_blocked_update(codex_update_recipient, issue, proof)
+            {:error, {:child_run_dispatcher_pre_turn_blocked, terminal_blocker_summary(proof)}}
+
+          {:error, reason} ->
+            Logger.warning("Child-run Dispatcher failed pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
+            {:error, {:child_run_dispatcher_pre_turn_blocked, reason}}
         end
 
-      {:block, proof} ->
-        Logger.warning("Child-run Dispatcher blocked pre-turn for #{issue_context(issue)} proof=#{inspect(terminal_blocker_summary(proof))}")
-        send_child_run_blocked_update(codex_update_recipient, issue, proof)
-        {:error, {:child_run_dispatcher_pre_turn_blocked, terminal_blocker_summary(proof)}}
-
       {:error, reason} ->
-        Logger.warning("Child-run Dispatcher failed pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
-        {:error, {:child_run_dispatcher_pre_turn_blocked, reason}}
+        Logger.warning("Codex thread goal contract blocked pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
+        send_codex_thread_goal_blocked_update(codex_update_recipient, issue, reason)
+        {:error, {:codex_thread_goal_contract_invalid, reason}}
     end
   end
 
@@ -183,6 +194,12 @@ defmodule SymphonyElixir.AgentRunner do
     child_run_dispatcher_proof(issue, opts)
   end
 
+  @doc false
+  @spec codex_thread_goal_contract_for_test(Issue.t()) :: {:ok, :not_requested | map()} | {:error, term()}
+  def codex_thread_goal_contract_for_test(%Issue{} = issue) do
+    codex_thread_goal_contract(issue)
+  end
+
   defp build_turn_prompt(workspace, issue, opts, 1, _max_turns) do
     child_run_proof = child_run_dispatcher_proof_result(issue, opts)
 
@@ -221,6 +238,199 @@ defmodule SymphonyElixir.AgentRunner do
   end
 
   defp continue_with_issue?(issue, _issue_state_fetcher), do: {:done, issue}
+
+  defp maybe_set_codex_thread_goal(_session, _issue, :not_requested, _recipient), do: :ok
+
+  defp maybe_set_codex_thread_goal(session, issue, %{objective: objective} = goal_contract, recipient) do
+    opts =
+      case Map.get(goal_contract, :token_budget) do
+        nil -> []
+        token_budget -> [token_budget: token_budget]
+      end
+
+    case AppServer.set_goal(session, objective, opts) do
+      {:ok, goal} ->
+        send_codex_update(recipient, issue, %{
+          event: :codex_thread_goal_set,
+          goal: codex_thread_goal_summary(goal),
+          timestamp: DateTime.utc_now()
+        })
+
+        :ok
+
+      {:error, reason} ->
+        send_codex_update(recipient, issue, %{
+          event: :codex_thread_goal_set_failed,
+          reason: reason,
+          timestamp: DateTime.utc_now()
+        })
+
+        {:error, {:codex_thread_goal_set_failed, reason}}
+    end
+  end
+
+  defp codex_thread_goal_summary(goal) when is_map(goal) do
+    Map.take(goal, ["threadId", "objective", "status", "tokenBudget", "tokensUsed", "timeUsedSeconds"])
+  end
+
+  defp codex_thread_goal_contract(%Issue{description: description}) when is_binary(description) do
+    case markdown_section(description, "Codex Thread Goal") do
+      :not_found ->
+        {:ok, :not_requested}
+
+      {:ok, section_body} ->
+        with :ok <- require_codex_thread_goal_capability(description) do
+          parse_codex_thread_goal_section(section_body)
+        end
+    end
+  end
+
+  defp codex_thread_goal_contract(%Issue{}), do: {:ok, :not_requested}
+
+  defp parse_codex_thread_goal_section(section_body) when is_binary(section_body) do
+    fields = section_fields(section_body)
+
+    with {:ok, objective} <- required_section_field(fields, "objective"),
+         {:ok, token_budget} <- optional_token_budget(fields) do
+      {:ok, %{objective: objective, token_budget: token_budget}}
+    end
+  end
+
+  defp require_codex_thread_goal_capability(description) when is_binary(description) do
+    case markdown_section(description, "Required Capabilities") do
+      {:ok, section_body} ->
+        if capability_requested?(section_body, @codex_thread_goal_capability_id) do
+          :ok
+        else
+          {:error, {:missing_codex_thread_goal_capability_request, @codex_thread_goal_capability_id}}
+        end
+
+      :not_found ->
+        {:error, {:missing_codex_thread_goal_capability_request, @codex_thread_goal_capability_id}}
+    end
+  end
+
+  defp capability_requested?(section_body, capability_id) when is_binary(section_body) and is_binary(capability_id) do
+    requested_id_pattern = Regex.compile!("(^|[^a-z0-9_-])`?#{Regex.escape(capability_id)}`?([^a-z0-9_-]|$)")
+
+    section_body
+    |> String.split("\n")
+    |> Enum.any?(fn line ->
+      line
+      |> String.trim()
+      |> String.downcase()
+      |> then(&Regex.match?(requested_id_pattern, &1))
+    end)
+  end
+
+  defp required_section_field(fields, field_name) when is_map(fields) and is_binary(field_name) do
+    case Map.get(fields, field_name) do
+      nil -> {:error, {:missing_codex_thread_goal_field, field_name}}
+      "" -> {:error, {:empty_codex_thread_goal_field, field_name}}
+      value -> {:ok, value}
+    end
+  end
+
+  defp optional_token_budget(fields) when is_map(fields) do
+    case Map.get(fields, "token_budget") || Map.get(fields, "tokenbudget") do
+      nil ->
+        {:ok, nil}
+
+      "" ->
+        {:ok, nil}
+
+      raw ->
+        case Integer.parse(raw) do
+          {token_budget, ""} when token_budget > 0 -> {:ok, token_budget}
+          _ -> {:error, {:invalid_codex_thread_goal_token_budget, raw}}
+        end
+    end
+  end
+
+  defp section_fields(section_body) when is_binary(section_body) do
+    section_body
+    |> String.split("\n")
+    |> Enum.reduce(%{}, fn line, fields ->
+      line
+      |> String.trim()
+      |> String.replace(~r/^\s*[-*]\s*/, "")
+      |> String.split(":", parts: 2)
+      |> case do
+        [key, value] ->
+          Map.put_new(fields, normalize_section_field_key(key), String.trim(value))
+
+        _ ->
+          fields
+      end
+    end)
+  end
+
+  defp normalize_section_field_key(key) when is_binary(key) do
+    key
+    |> String.trim()
+    |> String.downcase()
+    |> String.replace("-", "_")
+  end
+
+  defp markdown_section(description, section_title) when is_binary(description) and is_binary(section_title) do
+    lines = String.split(description, "\n")
+
+    case Enum.find_index(lines, &markdown_heading_title?(&1, section_title)) do
+      nil ->
+        :not_found
+
+      index ->
+        heading_level = lines |> Enum.at(index) |> markdown_heading_level()
+
+        body =
+          lines
+          |> Enum.drop(index + 1)
+          |> Enum.take_while(fn line ->
+            case markdown_heading_level(line) do
+              nil -> true
+              level -> level > heading_level
+            end
+          end)
+          |> Enum.join("\n")
+          |> String.trim()
+
+        {:ok, body}
+    end
+  end
+
+  defp markdown_heading_title?(line, expected_title) when is_binary(line) and is_binary(expected_title) do
+    case markdown_heading(line) do
+      {_level, title} -> normalize_markdown_heading_title(title) == normalize_markdown_heading_title(expected_title)
+      nil -> false
+    end
+  end
+
+  defp markdown_heading_level(line) when is_binary(line) do
+    case markdown_heading(line) do
+      {level, _title} -> level
+      nil -> nil
+    end
+  end
+
+  defp markdown_heading(line) when is_binary(line) do
+    case Regex.run(~r/^(#+)\s+(.+?)\s*#*\s*$/, String.trim(line), capture: :all_but_first) do
+      [markers, title] ->
+        level = String.length(markers)
+
+        if level in 2..6 do
+          {level, title}
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  defp normalize_markdown_heading_title(title) when is_binary(title) do
+    title
+    |> String.trim()
+    |> String.downcase()
+  end
 
   defp active_issue_state?(state_name) when is_binary(state_name) do
     normalized_state = normalize_issue_state(state_name)
@@ -500,6 +710,14 @@ defmodule SymphonyElixir.AgentRunner do
     send_codex_update(recipient, issue, %{
       event: :child_run_dispatcher_pre_turn_blocked,
       proof: terminal_blocker_summary(proof),
+      timestamp: DateTime.utc_now()
+    })
+  end
+
+  defp send_codex_thread_goal_blocked_update(recipient, issue, reason) do
+    send_codex_update(recipient, issue, %{
+      event: :codex_thread_goal_pre_turn_blocked,
+      reason: reason,
       timestamp: DateTime.utc_now()
     })
   end
