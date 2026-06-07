@@ -91,45 +91,64 @@ defmodule SymphonyElixir.AgentRunner do
     max_turns = Keyword.get(opts, :max_turns, Config.settings!().agent.max_turns)
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
 
+    with {:ok, codex_thread_goal} <- codex_thread_goal_contract_or_block(issue, codex_update_recipient),
+         {:ok, opts} <- child_run_opts_or_block(issue, opts, codex_update_recipient),
+         {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+      run_codex_session(
+        session,
+        workspace,
+        issue,
+        codex_thread_goal,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        max_turns
+      )
+    end
+  end
+
+  defp run_codex_session(session, workspace, issue, codex_thread_goal, codex_update_recipient, opts, issue_state_fetcher, max_turns) do
+    with :ok <- maybe_set_codex_thread_goal(session, issue, codex_thread_goal, codex_update_recipient) do
+      do_run_codex_turns(
+        session,
+        workspace,
+        issue,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        1,
+        max_turns
+      )
+    end
+  after
+    AppServer.stop_session(session)
+  end
+
+  defp codex_thread_goal_contract_or_block(issue, codex_update_recipient) do
     case codex_thread_goal_contract(issue) do
       {:ok, codex_thread_goal} ->
-        case child_run_pre_turn_gate(issue, opts) do
-          {:allow, child_run_proof} ->
-            opts = Keyword.put(opts, :child_run_dispatcher_proof_result, child_run_proof)
-
-            with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
-              try do
-                with :ok <- maybe_set_codex_thread_goal(session, issue, codex_thread_goal, codex_update_recipient) do
-                  do_run_codex_turns(
-                    session,
-                    workspace,
-                    issue,
-                    codex_update_recipient,
-                    opts,
-                    issue_state_fetcher,
-                    1,
-                    max_turns
-                  )
-                end
-              after
-                AppServer.stop_session(session)
-              end
-            end
-
-          {:block, proof} ->
-            Logger.warning("Child-run Dispatcher blocked pre-turn for #{issue_context(issue)} proof=#{inspect(terminal_blocker_summary(proof))}")
-            send_child_run_blocked_update(codex_update_recipient, issue, proof)
-            {:error, {:child_run_dispatcher_pre_turn_blocked, terminal_blocker_summary(proof)}}
-
-          {:error, reason} ->
-            Logger.warning("Child-run Dispatcher failed pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
-            {:error, {:child_run_dispatcher_pre_turn_blocked, reason}}
-        end
+        {:ok, codex_thread_goal}
 
       {:error, reason} ->
         Logger.warning("Codex thread goal contract blocked pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
         send_codex_thread_goal_blocked_update(codex_update_recipient, issue, reason)
         {:error, {:codex_thread_goal_contract_invalid, reason}}
+    end
+  end
+
+  defp child_run_opts_or_block(issue, opts, codex_update_recipient) do
+    case child_run_pre_turn_gate(issue, opts) do
+      {:allow, child_run_proof} ->
+        {:ok, Keyword.put(opts, :child_run_dispatcher_proof_result, child_run_proof)}
+
+      {:block, proof} ->
+        Logger.warning("Child-run Dispatcher blocked pre-turn for #{issue_context(issue)} proof=#{inspect(terminal_blocker_summary(proof))}")
+        send_child_run_blocked_update(codex_update_recipient, issue, proof)
+        {:error, {:child_run_dispatcher_pre_turn_blocked, terminal_blocker_summary(proof)}}
+
+      {:error, reason} ->
+        Logger.warning("Child-run Dispatcher failed pre-turn for #{issue_context(issue)} reason=#{inspect(reason)}")
+        {:error, {:child_run_dispatcher_pre_turn_blocked, reason}}
     end
   end
 
@@ -375,33 +394,46 @@ defmodule SymphonyElixir.AgentRunner do
   defp markdown_section(description, section_title) when is_binary(description) and is_binary(section_title) do
     lines = String.split(description, "\n")
 
-    case Enum.find_index(lines, &markdown_heading_title?(&1, section_title)) do
+    case markdown_section_start(lines, section_title) do
       nil ->
         :not_found
 
-      index ->
-        heading_level = lines |> Enum.at(index) |> markdown_heading_level()
-
-        body =
-          lines
-          |> Enum.drop(index + 1)
-          |> Enum.take_while(fn line ->
-            case markdown_heading_level(line) do
-              nil -> true
-              level -> level > heading_level
-            end
-          end)
-          |> Enum.join("\n")
-          |> String.trim()
-
-        {:ok, body}
+      {index, heading_level} ->
+        {:ok, markdown_section_body(lines, index, heading_level)}
     end
   end
 
-  defp markdown_heading_title?(line, expected_title) when is_binary(line) and is_binary(expected_title) do
+  defp markdown_section_start(lines, section_title) when is_list(lines) and is_binary(section_title) do
+    lines
+    |> Enum.with_index()
+    |> Enum.find_value(&markdown_section_start_candidate(&1, section_title))
+  end
+
+  defp markdown_section_start_candidate({line, index}, section_title) do
     case markdown_heading(line) do
-      {_level, title} -> normalize_markdown_heading_title(title) == normalize_markdown_heading_title(expected_title)
-      nil -> false
+      {level, title} -> markdown_section_start_match(index, level, title, section_title)
+      nil -> nil
+    end
+  end
+
+  defp markdown_section_start_match(index, level, title, section_title) do
+    if normalize_markdown_heading_title(title) == normalize_markdown_heading_title(section_title) do
+      {index, level}
+    end
+  end
+
+  defp markdown_section_body(lines, index, heading_level) when is_list(lines) do
+    lines
+    |> Enum.drop(index + 1)
+    |> Enum.take_while(&markdown_section_body_line?(&1, heading_level))
+    |> Enum.join("\n")
+    |> String.trim()
+  end
+
+  defp markdown_section_body_line?(line, heading_level) do
+    case markdown_heading_level(line) do
+      nil -> true
+      level -> level > heading_level
     end
   end
 
