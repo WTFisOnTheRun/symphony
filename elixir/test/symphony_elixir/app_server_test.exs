@@ -84,6 +84,111 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server manages Codex thread goals" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-thread-goal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-GOAL")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-thread-goal.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-thread-goal.trace}"
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-goal"}}}'
+            ;;
+          *'"method":"thread/goal/set"'*)
+            printf '%s\\n' '{"id":4,"result":{"goal":{"threadId":"thread-goal","objective":"Keep DTS-48 oriented","status":"active","tokenBudget":120000,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":1}}}'
+            ;;
+          *'"method":"thread/goal/get"'*)
+            printf '%s\\n' '{"id":5,"result":{"goal":{"threadId":"thread-goal","objective":"Keep DTS-48 oriented","status":"active","tokenBudget":120000,"tokensUsed":0,"timeUsedSeconds":0,"createdAt":1,"updatedAt":1}}}'
+            ;;
+          *'"method":"thread/goal/clear"'*)
+            printf '%s\\n' '{"id":6,"result":{"cleared":true}}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{bash_command_path(codex_binary)} app-server"
+      )
+
+      assert {:ok, session} = AppServer.start_session(workspace)
+
+      try do
+        assert {:error, {:invalid_thread_goal_token_budget, 0}} =
+                 AppServer.set_goal(session, "Reject invalid zero budget", token_budget: 0)
+
+        assert {:error, {:invalid_thread_goal_token_budget, "eventually"}} =
+                 AppServer.set_goal(session, "Reject invalid text budget", token_budget: "eventually")
+
+        assert {:ok, goal} = AppServer.set_goal(session, " Keep DTS-48 oriented ", token_budget: 120_000)
+        assert goal["threadId"] == "thread-goal"
+        assert goal["objective"] == "Keep DTS-48 oriented"
+        assert goal["status"] == "active"
+        assert goal["tokenBudget"] == 120_000
+
+        assert {:ok, fetched_goal} = AppServer.get_goal(session)
+        assert fetched_goal["objective"] == "Keep DTS-48 oriented"
+
+        assert {:ok, true} = AppServer.clear_goal(session)
+      after
+        AppServer.stop_session(session)
+      end
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
+
+      goal_set_payloads = Enum.filter(payloads, &(&1["method"] == "thread/goal/set"))
+      assert length(goal_set_payloads) == 1
+
+      goal_set_payload = List.first(goal_set_payloads)
+      assert get_in(goal_set_payload, ["params", "threadId"]) == "thread-goal"
+      assert get_in(goal_set_payload, ["params", "objective"]) == "Keep DTS-48 oriented"
+      assert get_in(goal_set_payload, ["params", "status"]) == "active"
+      assert get_in(goal_set_payload, ["params", "tokenBudget"]) == 120_000
+
+      assert Enum.any?(payloads, &(&1["method"] == "thread/goal/get"))
+      assert Enum.any?(payloads, &(&1["method"] == "thread/goal/clear"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server passes explicit turn sandbox policies through unchanged" do
     test_root =
       Path.join(
