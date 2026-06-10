@@ -296,6 +296,188 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "read-only child adapter starts a child thread without inherited dynamic tools" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-readonly-child-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "DTS-41")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-readonly-child.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-readonly-child.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"child-thread-41"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"child-turn-41"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{bash_command_path(codex_binary)} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-dts-41",
+        identifier: "DTS-41",
+        title: "Read-only child adapter",
+        description: "Prove the child adapter keeps parent tools out",
+        state: "Symphony Ready",
+        url: "https://example.org/issues/DTS-41",
+        labels: ["backend"]
+      }
+
+      assert {:ok, result} = AppServer.run_readonly_child(workspace, "Inspect one read target", issue)
+
+      assert result.adapter_version == "codex-app-server-readonly-child-thread-v0"
+      assert result.read_only_child
+      assert result.thread_id == "child-thread-41"
+      assert result.turn_id == "child-turn-41"
+      assert result.session_id == "child-thread-41-child-turn-41"
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+
+      assert get_in(thread_start, ["params", "dynamicTools"]) == []
+      assert get_in(thread_start, ["params", "sandbox"]) == "read-only"
+      refute get_in(thread_start, ["params", "approvalPolicy"]) == "never"
+
+      assert get_in(turn_start, ["params", "sandboxPolicy"]) == %{
+               "type" => "readOnly",
+               "access" => %{"type" => "fullAccess"}
+             }
+
+      assert get_in(turn_start, ["params", "outputSchema", "additionalProperties"]) == false
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "read-only child adapter does not auto-approve side-effect approvals" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-readonly-child-approval-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "DTS-41")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-readonly-child-approval.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn -> restore_env("SYMP_TEST_CODEx_TRACE", previous_trace) end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-readonly-child-approval.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"child-thread-denial"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"child-turn-denial"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"git commit -m nope","cwd":"/tmp","reason":"denial probe"}}'
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{bash_command_path(codex_binary)} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-dts-41-denial",
+        identifier: "DTS-41",
+        title: "Read-only child denial probe",
+        description: "Ensure child approval probes are denied",
+        state: "Symphony Ready",
+        url: "https://example.org/issues/DTS-41",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:approval_required, payload}} =
+               AppServer.run_readonly_child(workspace, "Try denied action", issue)
+
+      assert payload["method"] == "item/commandExecution/requestApproval"
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(fn line -> line |> String.trim_leading("JSON:") |> Jason.decode!() end)
+
+      refute Enum.any?(payloads, &(get_in(&1, ["result", "decision"]) == "acceptForSession"))
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
