@@ -15,6 +15,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
+  @readonly_child_adapter_version "codex-app-server-readonly-child-thread-v0"
+  @readonly_child_approval_policy %{
+    "reject" => %{
+      "sandbox_approval" => true,
+      "rules" => true,
+      "mcp_elicitations" => true
+    }
+  }
+  @readonly_child_thread_sandbox "read-only"
+  @readonly_child_turn_sandbox_policy %{
+    "type" => "readOnly",
+    "access" => %{"type" => "fullAccess"}
+  }
 
   @type session :: %{
           port: port(),
@@ -40,6 +53,57 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
+  @spec readonly_child_adapter_version() :: String.t()
+  def readonly_child_adapter_version, do: @readonly_child_adapter_version
+
+  @spec readonly_child_output_schema() :: map()
+  def readonly_child_output_schema do
+    %{
+      "type" => "object",
+      "properties" => %{
+        "summary" => %{"type" => "string"},
+        "findings" => %{
+          "type" => "array",
+          "items" => %{
+            "type" => "object",
+            "properties" => %{
+              "source" => %{"type" => "string"},
+              "finding" => %{"type" => "string"}
+            },
+            "required" => ["source", "finding"],
+            "additionalProperties" => false
+          }
+        }
+      },
+      "required" => ["summary", "findings"],
+      "additionalProperties" => false
+    }
+  end
+
+  @spec run_readonly_child(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
+  def run_readonly_child(workspace, prompt, issue, opts \\ []) do
+    child_opts =
+      opts
+      |> Keyword.put(:approval_policy, @readonly_child_approval_policy)
+      |> Keyword.put(:thread_sandbox, @readonly_child_thread_sandbox)
+      |> Keyword.put(:turn_sandbox_policy, @readonly_child_turn_sandbox_policy)
+      |> Keyword.put(:dynamic_tools, [])
+      |> Keyword.put(:auto_approve_requests, false)
+      |> Keyword.put(:tool_executor, &deny_readonly_child_tool_call/2)
+      |> Keyword.put(:output_schema, Keyword.get(opts, :output_schema, readonly_child_output_schema()))
+
+    case run(workspace, prompt, issue, child_opts) do
+      {:ok, result} ->
+        {:ok,
+         result
+         |> Map.put(:adapter_version, @readonly_child_adapter_version)
+         |> Map.put(:read_only_child, true)}
+
+      other ->
+        other
+    end
+  end
+
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
@@ -47,15 +111,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
+      dynamic_tools = Keyword.get(opts, :dynamic_tools, DynamicTool.tool_specs())
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host, opts),
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies, dynamic_tools) do
         {:ok,
          %{
            port: port,
            metadata: metadata,
            approval_policy: session_policies.approval_policy,
-           auto_approve_requests: session_policies.approval_policy == "never",
+           auto_approve_requests: Keyword.get(opts, :auto_approve_requests, session_policies.approval_policy == "never"),
            thread_sandbox: session_policies.thread_sandbox,
            turn_sandbox_policy: session_policies.turn_sandbox_policy,
            thread_id: thread_id,
@@ -92,7 +157,9 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    output_schema = Keyword.get(opts, :output_schema)
+
+    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, output_schema) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -309,22 +376,36 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp session_policies(workspace, nil) do
-    Config.codex_runtime_settings(workspace)
+  defp session_policies(workspace, nil, opts) do
+    with {:ok, policies} <- Config.codex_runtime_settings(workspace) do
+      {:ok, override_session_policies(policies, opts)}
+    end
   end
 
-  defp session_policies(workspace, worker_host) when is_binary(worker_host) do
-    Config.codex_runtime_settings(workspace, remote: true)
+  defp session_policies(workspace, worker_host, opts) when is_binary(worker_host) do
+    with {:ok, policies} <- Config.codex_runtime_settings(workspace, remote: true) do
+      {:ok, override_session_policies(policies, opts)}
+    end
   end
 
-  defp do_start_session(port, workspace, session_policies) do
+  defp override_session_policies(policies, opts) do
+    Enum.reduce([:approval_policy, :thread_sandbox, :turn_sandbox_policy], policies, fn key, updated ->
+      if Keyword.has_key?(opts, key) do
+        Map.put(updated, key, Keyword.fetch!(opts, key))
+      else
+        updated
+      end
+    end)
+  end
+
+  defp do_start_session(port, workspace, session_policies, dynamic_tools) do
     case send_initialize(port) do
-      :ok -> start_thread(port, workspace, session_policies)
+      :ok -> start_thread(port, workspace, session_policies, dynamic_tools)
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}) do
+  defp start_thread(port, workspace, %{approval_policy: approval_policy, thread_sandbox: thread_sandbox}, dynamic_tools) do
     send_message(port, %{
       "method" => "thread/start",
       "id" => @thread_start_id,
@@ -332,7 +413,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandbox" => thread_sandbox,
         "cwd" => workspace,
-        "dynamicTools" => DynamicTool.tool_specs()
+        "dynamicTools" => dynamic_tools
       }
     })
 
@@ -348,11 +429,9 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
-    send_message(port, %{
-      "method" => "turn/start",
-      "id" => @turn_start_id,
-      "params" => %{
+  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy, output_schema) do
+    params =
+      %{
         "threadId" => thread_id,
         "input" => [
           %{
@@ -365,12 +444,28 @@ defmodule SymphonyElixir.Codex.AppServer do
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }
+      |> maybe_put_param("outputSchema", output_schema)
+
+    send_message(port, %{
+      "method" => "turn/start",
+      "id" => @turn_start_id,
+      "params" => params
     })
 
     case await_response(port, @turn_start_id) do
       {:ok, %{"turn" => %{"id" => turn_id}}} -> {:ok, turn_id}
       other -> other
     end
+  end
+
+  defp maybe_put_param(params, _key, nil), do: params
+  defp maybe_put_param(params, key, value), do: Map.put(params, key, value)
+
+  defp deny_readonly_child_tool_call(tool, _arguments) do
+    %{
+      "success" => false,
+      "output" => "Read-only child dynamic tools are disabled: #{inspect(tool)}"
+    }
   end
 
   defp await_turn_completion(port, on_message, tool_executor, auto_approve_requests) do
