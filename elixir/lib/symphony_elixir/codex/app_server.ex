@@ -105,37 +105,55 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp validate_readonly_child_output_schema(schema) when is_map(schema) do
-    required = schema_value(schema, "required") || []
-    properties = schema_value(schema, "properties") || %{}
-    missing_required = @readonly_child_required_output_fields -- List.wrap(required)
-    missing_properties = Enum.reject(@readonly_child_required_output_fields, &Map.has_key?(properties, &1))
-
-    cond do
-      schema_value(schema, "type") != "object" ->
-        {:error, {:invalid_readonly_child_output_schema, :type_must_be_object}}
-
-      schema_value(schema, "additionalProperties") != false ->
-        {:error, {:invalid_readonly_child_output_schema, :additional_properties_must_be_false}}
-
-      not is_list(required) ->
-        {:error, {:invalid_readonly_child_output_schema, :required_must_be_list}}
-
-      not is_map(properties) ->
-        {:error, {:invalid_readonly_child_output_schema, :properties_must_be_map}}
-
-      missing_required != [] ->
-        {:error, {:readonly_child_output_schema_missing_required_fields, missing_required}}
-
-      missing_properties != [] ->
-        {:error, {:readonly_child_output_schema_missing_properties, missing_properties}}
-
-      true ->
-        :ok
+    with :ok <- validate_schema_object_type(schema),
+         :ok <- validate_schema_additional_properties(schema),
+         :ok <- validate_schema_required_fields(schema) do
+      validate_schema_properties(schema)
     end
   end
 
   defp validate_readonly_child_output_schema(_schema) do
     {:error, {:invalid_readonly_child_output_schema, :schema_must_be_map}}
+  end
+
+  defp validate_schema_object_type(schema) do
+    case schema_value(schema, "type") do
+      "object" -> :ok
+      _ -> {:error, {:invalid_readonly_child_output_schema, :type_must_be_object}}
+    end
+  end
+
+  defp validate_schema_additional_properties(schema) do
+    case schema_value(schema, "additionalProperties") do
+      false -> :ok
+      _ -> {:error, {:invalid_readonly_child_output_schema, :additional_properties_must_be_false}}
+    end
+  end
+
+  defp validate_schema_required_fields(schema) do
+    case schema_value(schema, "required") do
+      required when is_list(required) ->
+        case @readonly_child_required_output_fields -- required do
+          [] -> :ok
+          missing -> {:error, {:readonly_child_output_schema_missing_required_fields, missing}}
+        end
+
+      _ ->
+        {:error, {:invalid_readonly_child_output_schema, :required_must_be_list}}
+    end
+  end
+
+  defp validate_schema_properties(schema) do
+    case schema_value(schema, "properties") do
+      properties when is_map(properties) ->
+        case Enum.reject(@readonly_child_required_output_fields, &Map.has_key?(properties, &1)) do
+          [] -> :ok
+          missing -> {:error, {:readonly_child_output_schema_missing_properties, missing}}
+        end
+
+      _ ->
+        {:error, {:invalid_readonly_child_output_schema, :properties_must_be_map}}
+    end
   end
 
   defp schema_value(schema, key) when is_map(schema) do
