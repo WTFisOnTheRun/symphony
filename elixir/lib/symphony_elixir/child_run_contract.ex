@@ -13,6 +13,7 @@ defmodule SymphonyElixir.ChildRunContract do
     git_mutation: [:git_commit, :git_push, :git_checkout, :git_reset],
     linear_mutation: [:linear_comment, :linear_status, :linear_relationship],
     browser_action: [:browser_click, :browser_type, :browser_navigate],
+    business_system: [:salesforce_query, :salesforce_read, :salesforce_cli, :business_system_read],
     nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent, :subagent_fork]
   }
   @known_tool_lookup Map.new(

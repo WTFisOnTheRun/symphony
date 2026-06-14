@@ -69,6 +69,7 @@ defmodule SymphonyElixir.ChildRunContractTest do
           :git_commit,
           :linear_status,
           :browser_click,
+          :salesforce_query,
           :spawn_agent
         ]
       )
@@ -82,6 +83,7 @@ defmodule SymphonyElixir.ChildRunContractTest do
     assert :git_commit in grant.denied_tools
     assert :linear_status in grant.denied_tools
     assert :browser_click in grant.denied_tools
+    assert :salesforce_query in grant.denied_tools
     assert :spawn_agent in grant.denied_tools
 
     assert MapSet.new(grant.denied_tool_classes) ==
@@ -91,6 +93,7 @@ defmodule SymphonyElixir.ChildRunContractTest do
                :git_mutation,
                :linear_mutation,
                :browser_action,
+               :business_system,
                :nested_agent
              ])
 
@@ -115,6 +118,7 @@ defmodule SymphonyElixir.ChildRunContractTest do
              git_mutation: [:git_commit, :git_push, :git_checkout, :git_reset],
              linear_mutation: [:linear_comment, :linear_status, :linear_relationship],
              browser_action: [:browser_click, :browser_type, :browser_navigate],
+             business_system: [:salesforce_query, :salesforce_read, :salesforce_cli, :business_system_read],
              nested_agent: [:spawn_agent, :wait_agent, :send_input, :resume_agent, :close_agent, :subagent_fork]
            }
   end
@@ -122,14 +126,16 @@ defmodule SymphonyElixir.ChildRunContractTest do
   test "binary tool names normalize without creating arbitrary atoms" do
     {:ok, contract} =
       ChildRunContract.build(@parent_context,
-        requested_tools: ["read-file", "write-file", "unknown-danger", "*", "subagent-fork"]
+        requested_tools: ["read-file", "write-file", "unknown-danger", "*", "salesforce-query", "subagent-fork"]
       )
 
     assert contract.effective_tool_grant.allowed_tools == [:read_file]
     assert :write_file in contract.effective_tool_grant.denied_tools
     assert :unknown_tool in contract.effective_tool_grant.denied_tools
     assert :all_tools in contract.effective_tool_grant.denied_tools
+    assert :salesforce_query in contract.effective_tool_grant.denied_tools
     assert :subagent_fork in contract.effective_tool_grant.denied_tools
+    assert :business_system in contract.effective_tool_grant.denied_tool_classes
     assert :nested_agent in contract.effective_tool_grant.denied_tool_classes
   end
 

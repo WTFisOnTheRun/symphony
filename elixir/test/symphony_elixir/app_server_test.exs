@@ -383,7 +383,8 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert get_in(thread_start, ["params", "dynamicTools"]) == []
       assert get_in(thread_start, ["params", "sandbox"]) == "read-only"
-      refute get_in(thread_start, ["params", "approvalPolicy"]) == "never"
+      assert get_in(thread_start, ["params", "approvalPolicy"]) == "on-request"
+      assert get_in(turn_start, ["params", "approvalPolicy"]) == "on-request"
 
       assert get_in(turn_start, ["params", "sandboxPolicy"]) == %{
                "type" => "readOnly",
@@ -391,9 +392,43 @@ defmodule SymphonyElixir.AppServerTest do
              }
 
       assert get_in(turn_start, ["params", "outputSchema", "additionalProperties"]) == false
+
+      assert Enum.sort(get_in(turn_start, ["params", "outputSchema", "required"])) ==
+               Enum.sort([
+                 "finding",
+                 "checked_paths",
+                 "confidence",
+                 "risks_conflicts",
+                 "recommended_parent_action"
+               ])
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "read-only child adapter rejects malformed output schema before app-server launch" do
+    issue = %Issue{
+      id: "issue-dts-41-malformed-schema",
+      identifier: "DTS-41",
+      title: "Read-only child malformed output schema",
+      description: "Ensure child schema probes fail closed",
+      state: "Symphony Ready",
+      url: "https://example.org/issues/DTS-41",
+      labels: ["backend"]
+    }
+
+    assert {:error, {:readonly_child_output_schema_missing_required_fields, missing_fields}} =
+             AppServer.run_readonly_child("C:/missing-workspace", "Try malformed schema", issue,
+               output_schema: %{
+                 "type" => "object",
+                 "properties" => %{},
+                 "required" => [],
+                 "additionalProperties" => false
+               }
+             )
+
+    assert "finding" in missing_fields
+    assert "recommended_parent_action" in missing_fields
   end
 
   test "read-only child adapter does not auto-approve side-effect approvals" do

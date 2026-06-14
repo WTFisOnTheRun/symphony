@@ -94,7 +94,7 @@ defmodule SymphonyElixir.ChildRunReadOnlyAdapter do
     Effective read-only tools:
     #{format_lines(get_in(dispatcher_proof, [:effective_tool_grant, :allowed_tools]) || [])}
 
-    Return only the requested schema. Do not write files, run shell commands, mutate git, mutate Linear, operate a browser, or spawn nested agents. Parent Runner owns synthesis, Evidence, memory, and status.
+    Return only the requested schema with these fields: finding, checked_paths, confidence, risks_conflicts, recommended_parent_action. Do not write files, run shell commands, mutate git, mutate Linear, access Salesforce or other business systems, operate a browser, or spawn nested agents. Parent Runner owns synthesis, Evidence, memory, and status.
     """
   end
 
