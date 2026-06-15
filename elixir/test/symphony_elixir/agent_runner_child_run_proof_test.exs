@@ -177,7 +177,7 @@ defmodule SymphonyElixir.AgentRunnerChildRunProofTest do
       @valid_description <>
         """
 
-        Requested child tools: read_file, write_file, shell, apply_patch, git_commit, linear_status, browser_click, spawn_agent
+        Requested child tools: read_file, write_file, shell, apply_patch, git_commit, linear_status, browser_click, salesforce_query, spawn_agent
         """
 
     assert {:error, proof} = AgentRunner.child_run_dispatcher_proof_for_test(issue(description))
@@ -194,6 +194,7 @@ defmodule SymphonyElixir.AgentRunnerChildRunProofTest do
                :git_mutation,
                :linear_mutation,
                :browser_action,
+               :business_system,
                :nested_agent
              ])
 
@@ -203,6 +204,7 @@ defmodule SymphonyElixir.AgentRunnerChildRunProofTest do
     assert :git_commit in proof.effective_tool_grant.denied_tools
     assert :linear_status in proof.effective_tool_grant.denied_tools
     assert :browser_click in proof.effective_tool_grant.denied_tools
+    assert :salesforce_query in proof.effective_tool_grant.denied_tools
     assert :spawn_agent in proof.effective_tool_grant.denied_tools
   end
 

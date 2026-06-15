@@ -16,18 +16,19 @@ defmodule SymphonyElixir.Codex.AppServer do
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
   @readonly_child_adapter_version "codex-app-server-readonly-child-thread-v0"
-  @readonly_child_approval_policy %{
-    "reject" => %{
-      "sandbox_approval" => true,
-      "rules" => true,
-      "mcp_elicitations" => true
-    }
-  }
+  @readonly_child_approval_policy "on-request"
   @readonly_child_thread_sandbox "read-only"
   @readonly_child_turn_sandbox_policy %{
     "type" => "readOnly",
     "access" => %{"type" => "fullAccess"}
   }
+  @readonly_child_required_output_fields [
+    "finding",
+    "checked_paths",
+    "confidence",
+    "risks_conflicts",
+    "recommended_parent_action"
+  ]
 
   @type session :: %{
           port: port(),
@@ -61,27 +62,27 @@ defmodule SymphonyElixir.Codex.AppServer do
     %{
       "type" => "object",
       "properties" => %{
-        "summary" => %{"type" => "string"},
-        "findings" => %{
+        "finding" => %{"type" => "string"},
+        "checked_paths" => %{
           "type" => "array",
-          "items" => %{
-            "type" => "object",
-            "properties" => %{
-              "source" => %{"type" => "string"},
-              "finding" => %{"type" => "string"}
-            },
-            "required" => ["source", "finding"],
-            "additionalProperties" => false
-          }
-        }
+          "items" => %{"type" => "string"}
+        },
+        "confidence" => %{"type" => "string"},
+        "risks_conflicts" => %{
+          "type" => "array",
+          "items" => %{"type" => "string"}
+        },
+        "recommended_parent_action" => %{"type" => "string"}
       },
-      "required" => ["summary", "findings"],
+      "required" => @readonly_child_required_output_fields,
       "additionalProperties" => false
     }
   end
 
   @spec run_readonly_child(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_readonly_child(workspace, prompt, issue, opts \\ []) do
+    output_schema = Keyword.get(opts, :output_schema, readonly_child_output_schema())
+
     child_opts =
       opts
       |> Keyword.put(:approval_policy, @readonly_child_approval_policy)
@@ -90,17 +91,78 @@ defmodule SymphonyElixir.Codex.AppServer do
       |> Keyword.put(:dynamic_tools, [])
       |> Keyword.put(:auto_approve_requests, false)
       |> Keyword.put(:tool_executor, &deny_readonly_child_tool_call/2)
-      |> Keyword.put(:output_schema, Keyword.get(opts, :output_schema, readonly_child_output_schema()))
+      |> Keyword.put(:output_schema, output_schema)
 
-    case run(workspace, prompt, issue, child_opts) do
-      {:ok, result} ->
-        {:ok,
-         result
-         |> Map.put(:adapter_version, @readonly_child_adapter_version)
-         |> Map.put(:read_only_child, true)}
+    with :ok <- validate_readonly_child_output_schema(output_schema),
+         {:ok, result} <- run(workspace, prompt, issue, child_opts) do
+      {:ok,
+       result
+       |> Map.put(:adapter_version, @readonly_child_adapter_version)
+       |> Map.put(:read_only_child, true)}
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
 
-      other ->
-        other
+  defp validate_readonly_child_output_schema(schema) when is_map(schema) do
+    with :ok <- validate_schema_object_type(schema),
+         :ok <- validate_schema_additional_properties(schema),
+         :ok <- validate_schema_required_fields(schema) do
+      validate_schema_properties(schema)
+    end
+  end
+
+  defp validate_readonly_child_output_schema(_schema) do
+    {:error, {:invalid_readonly_child_output_schema, :schema_must_be_map}}
+  end
+
+  defp validate_schema_object_type(schema) do
+    case schema_value(schema, "type") do
+      "object" -> :ok
+      _ -> {:error, {:invalid_readonly_child_output_schema, :type_must_be_object}}
+    end
+  end
+
+  defp validate_schema_additional_properties(schema) do
+    case schema_value(schema, "additionalProperties") do
+      false -> :ok
+      _ -> {:error, {:invalid_readonly_child_output_schema, :additional_properties_must_be_false}}
+    end
+  end
+
+  defp validate_schema_required_fields(schema) do
+    case schema_value(schema, "required") do
+      required when is_list(required) ->
+        case @readonly_child_required_output_fields -- required do
+          [] -> :ok
+          missing -> {:error, {:readonly_child_output_schema_missing_required_fields, missing}}
+        end
+
+      _ ->
+        {:error, {:invalid_readonly_child_output_schema, :required_must_be_list}}
+    end
+  end
+
+  defp validate_schema_properties(schema) do
+    case schema_value(schema, "properties") do
+      properties when is_map(properties) ->
+        case Enum.reject(@readonly_child_required_output_fields, &Map.has_key?(properties, &1)) do
+          [] -> :ok
+          missing -> {:error, {:readonly_child_output_schema_missing_properties, missing}}
+        end
+
+      _ ->
+        {:error, {:invalid_readonly_child_output_schema, :properties_must_be_map}}
+    end
+  end
+
+  defp schema_value(schema, key) when is_map(schema) do
+    atom_key = String.to_atom(key)
+
+    cond do
+      Map.has_key?(schema, key) -> Map.fetch!(schema, key)
+      Map.has_key?(schema, atom_key) -> Map.fetch!(schema, atom_key)
+      true -> nil
     end
   end
 
